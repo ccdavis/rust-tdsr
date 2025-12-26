@@ -1,0 +1,71 @@
+[package]
+name = "tdsr"
+version = "0.1.0"
+authors = ["Tyler Spivey <tspivey@pcdesk.net>"]
+edition = "2021"
+rust-version = "1.70"
+description = "A console-based screen reader for *nix systems"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/tspivey/tdsr"
+keywords = ["accessibility", "screen-reader", "terminal", "tts"]
+categories = ["accessibility", "command-line-utilities"]
+
+[[bin]]
+name = "tdsr"
+path = "src/main.rs"
+
+[dependencies]
+# Terminal emulation
+vte = "0.13"
+portable-pty = "0.8"
+
+# Unicode and text processing
+unicode-width = "0.2"
+regex = "1.10"
+
+# Configuration
+rust-ini = "0.21"
+
+# I/O and event handling
+mio = { version = "1.0", features = ["os-poll", "os-ext"] }
+nix = { version = "0.29", features = ["term", "signal", "ioctl", "process", "fs", "poll"] }
+
+# Clipboard
+arboard = { version = "3.4", features = ["wayland-data-control"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Serialization (for plugin system and config)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Lazy static initialization
+once_cell = "1.19"
+
+# Directory utilities
+dirs = "5.0"
+
+# Text-to-speech
+tts = "0.26"
+
+# Platform-specific dependencies
+[target.'cfg(target_os = "linux")'.dependencies]
+# Speech Dispatcher for Linux TTS (now using native bindings via tts crate)
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS speech synthesis (now using AVFoundation via tts crate)
+
+[dev-dependencies]
+tempfile = "3.12"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -22,13 +22,13 @@ Also, it's nice to have a single binary to deploy wherever you need a talking te
 
 ## Screen Reader Features
 
-✅ **Review Cursor Navigation** - Navigate screen content independently of the terminal cursor
-✅ **Speech Synthesis** - Platform-native speech (macOS AVFoundation, Linux Speech Dispatcher)
-✅ **Symbol Processing** - Convert special characters to words ("!" → "bang", "$" → "dollar")
-✅ **Copy/Selection** - Copy lines, screen content, or selected regions to clipboard
-✅ **Plugin System** - Extend functionality with external scripts (Python, shell, etc.)
-✅ **Configuration** - Customizable key bindings, speech settings, and symbols
-✅ **Wide Character Support** - Proper handling of CJK characters and emoji
+- ✅ **Review Cursor Navigation** - Navigate screen content independently of the terminal cursor
+- ✅ **Speech Synthesis** - Platform-native speech (macOS AVFoundation, Linux Speech Dispatcher)
+- ✅ **Symbol Processing** - Convert special characters to words ("!" → "bang", "$" → "dollar")
+- ✅ **Copy/Selection** - Copy lines, screen content, or selected regions to clipboard
+- ✅ **Plugin System** - Extend functionality with external scripts (Python, shell, etc.)
+- ✅ **Configuration** - Customizable key bindings, speech settings, and symbols
+- ✅ **Wide Character Support** - Proper handling of CJK characters and emoji
 
 ## Installation
 

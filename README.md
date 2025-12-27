@@ -6,7 +6,7 @@ A console-based screen reader for *nix systems (macOS, Linux, FreeBSD) written i
 
 This is a version of the TDSR Python terminal screen reader re-written in Rust. It's currently at an alpha state. Mostly functioning, but  with some bugs, not tested in all environments yet.
 
-Tyler Spivey created the  [Original Python TDSR](https://github.com/tspivey/tdsr)and all credit goes to im for the design and features.
+Tyler Spivey created the  [Original Python TDSR](https://github.com/tspivey/tdsr)and all credit goes to him for the design and features.
 
 `rust-tdsr` is an AI-written translation from Python. It's mostly done by Claude Code / Sonnet 4.5 and Opus 4.5 with reviews from Codex GPT 5.2 and Gemini CLI using 3.0 Pro. My main contributions are:
 * I know Rust and Python

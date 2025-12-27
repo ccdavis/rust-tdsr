@@ -74,7 +74,10 @@ impl CopyHandler {
                     debug!("Failed to copy screen: {}", e);
                     state.speak("failed")?;
                 } else {
-                    debug!("Copied screen to clipboard: {} lines", emulator.screen().size.1);
+                    debug!(
+                        "Copied screen to clipboard: {} lines",
+                        emulator.screen().size.1
+                    );
                     state.speak("screen")?;
                 }
 
@@ -97,7 +100,12 @@ impl KeyHandler for CopyHandler {
         Ok(HandlerAction::Handled)
     }
 
-    fn process_with_context(&mut self, key: &[u8], state: &mut State, emulator: &mut Emulator) -> Result<HandlerAction> {
+    fn process_with_context(
+        &mut self,
+        key: &[u8],
+        state: &mut State,
+        emulator: &mut Emulator,
+    ) -> Result<HandlerAction> {
         self.process_with_state(key, state, emulator)
     }
 }

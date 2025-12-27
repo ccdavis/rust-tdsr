@@ -82,7 +82,9 @@ impl Pty {
             .map_err(|e| TdsrError::Pty(format!("Failed to spawn child: {}", e)))?;
 
         // Extract the file descriptor from the master
-        let original_fd = pair.master.as_raw_fd()
+        let original_fd = pair
+            .master
+            .as_raw_fd()
             .ok_or_else(|| TdsrError::Pty("Failed to get PTY file descriptor".to_string()))?;
 
         debug!("Original PTY file descriptor: {}", original_fd);
@@ -105,7 +107,9 @@ impl Pty {
             .map_err(|e| TdsrError::Pty(format!("Failed to get PTY reader: {}", e)))?;
 
         // Take the writer (this consumes the master, but we already have our dup'd fd)
-        let writer = pair.master.take_writer()
+        let writer = pair
+            .master
+            .take_writer()
             .map_err(|e| TdsrError::Pty(format!("Failed to get PTY writer: {}", e)))?;
 
         debug!("PTY created successfully with fd {}", fd);
@@ -152,7 +156,10 @@ impl Pty {
     /// Screen reader needs to resize both PTY and internal screen buffer.
     /// Note: portable-pty doesn't support runtime resize, so this is a no-op for now
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
-        debug!("PTY resize requested to {}x{} (not supported by portable-pty)", rows, cols);
+        debug!(
+            "PTY resize requested to {}x{} (not supported by portable-pty)",
+            rows, cols
+        );
         // TODO: portable-pty doesn't support resizing after creation
         // May need to use nix directly for this
         Ok(())

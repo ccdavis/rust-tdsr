@@ -46,7 +46,7 @@ mod tests {
     fn test_resize() {
         let mut cursor = ReviewCursor::new(80, 24);
         cursor.pos = (79, 23);
-        
+
         cursor.resize(40, 12);
         assert_eq!(cursor.bounds, (40, 12));
         // Position should be clamped to new size
@@ -57,7 +57,7 @@ mod tests {
     fn test_resize_no_clamp() {
         let mut cursor = ReviewCursor::new(80, 24);
         cursor.pos = (10, 5);
-        
+
         cursor.resize(100, 50);
         assert_eq!(cursor.bounds, (100, 50));
         // Position should remain unchanged

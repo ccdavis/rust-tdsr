@@ -4,8 +4,8 @@
 //! (e.g., entering a rate value in config menu)
 
 use super::{HandlerAction, KeyHandler};
-use crate::terminal::Emulator;
 use crate::state::State;
+use crate::terminal::Emulator;
 use crate::Result;
 use log::debug;
 
@@ -79,7 +79,12 @@ impl KeyHandler for BufferHandler {
         Ok(HandlerAction::Handled)
     }
 
-    fn process_with_context(&mut self, key: &[u8], state: &mut State, _emulator: &mut Emulator) -> Result<HandlerAction> {
+    fn process_with_context(
+        &mut self,
+        key: &[u8],
+        state: &mut State,
+        _emulator: &mut Emulator,
+    ) -> Result<HandlerAction> {
         self.process_with_state(key, state)
     }
 }

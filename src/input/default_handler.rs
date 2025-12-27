@@ -35,7 +35,10 @@ impl DefaultKeyHandler {
     ///
     /// Initializes the keymap with all screen reader navigation commands
     pub fn new(keymap: HashMap<Vec<u8>, KeyAction>) -> Self {
-        debug!("Creating default key handler with {} bindings", keymap.len());
+        debug!(
+            "Creating default key handler with {} bindings",
+            keymap.len()
+        );
         Self {
             keymap,
             last_key: None,
@@ -123,9 +126,9 @@ impl DefaultKeyHandler {
             Config => {
                 debug!("Entering config mode");
                 state.speak("config")?;
-                state.handlers.push(Box::new(
-                    super::config_handler::ConfigHandler::new(),
-                ));
+                state
+                    .handlers
+                    .push(Box::new(super::config_handler::ConfigHandler::new()));
                 Ok(HandlerAction::Handled)
             }
 
@@ -142,9 +145,9 @@ impl DefaultKeyHandler {
             CopyMode => {
                 debug!("Entering copy mode");
                 state.speak("copy")?;
-                state.handlers.push(Box::new(
-                    super::copy_handler::CopyHandler::new(),
-                ));
+                state
+                    .handlers
+                    .push(Box::new(super::copy_handler::CopyHandler::new()));
                 Ok(HandlerAction::Handled)
             }
 
@@ -267,10 +270,14 @@ impl DefaultKeyHandler {
                 debug!("Arrow up");
                 if state.config.cursor_tracking() {
                     let delay = Duration::from_secs_f32(state.config.cursor_delay());
-                    state.schedule(delay, |state, screen| {
-                        let cursor = state.review.pos;
-                        state.say_line(screen, cursor.1)
-                    }, true);
+                    state.schedule(
+                        delay,
+                        |state, screen| {
+                            let cursor = state.review.pos;
+                            state.say_line(screen, cursor.1)
+                        },
+                        true,
+                    );
                 }
                 Ok(HandlerAction::Passthrough)
             }
@@ -279,10 +286,14 @@ impl DefaultKeyHandler {
                 debug!("Arrow down");
                 if state.config.cursor_tracking() {
                     let delay = Duration::from_secs_f32(state.config.cursor_delay());
-                    state.schedule(delay, |state, screen| {
-                        let cursor = state.review.pos;
-                        state.say_line(screen, cursor.1)
-                    }, true);
+                    state.schedule(
+                        delay,
+                        |state, screen| {
+                            let cursor = state.review.pos;
+                            state.say_line(screen, cursor.1)
+                        },
+                        true,
+                    );
                 }
                 Ok(HandlerAction::Passthrough)
             }
@@ -291,10 +302,14 @@ impl DefaultKeyHandler {
                 debug!("Arrow left");
                 if state.config.cursor_tracking() {
                     let delay = Duration::from_secs_f32(state.config.cursor_delay());
-                    state.schedule(delay, |state, screen| {
-                        let cursor = state.review.pos;
-                        state.say_char(screen, cursor.1, cursor.0, false)
-                    }, true);
+                    state.schedule(
+                        delay,
+                        |state, screen| {
+                            let cursor = state.review.pos;
+                            state.say_char(screen, cursor.1, cursor.0, false)
+                        },
+                        true,
+                    );
                 }
                 Ok(HandlerAction::Passthrough)
             }
@@ -303,10 +318,14 @@ impl DefaultKeyHandler {
                 debug!("Arrow right");
                 if state.config.cursor_tracking() {
                     let delay = Duration::from_secs_f32(state.config.cursor_delay());
-                    state.schedule(delay, |state, screen| {
-                        let cursor = state.review.pos;
-                        state.say_char(screen, cursor.1, cursor.0, false)
-                    }, true);
+                    state.schedule(
+                        delay,
+                        |state, screen| {
+                            let cursor = state.review.pos;
+                            state.say_char(screen, cursor.1, cursor.0, false)
+                        },
+                        true,
+                    );
                 }
                 Ok(HandlerAction::Passthrough)
             }

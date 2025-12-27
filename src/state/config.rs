@@ -3,7 +3,7 @@
 use crate::{Result, TdsrError};
 use ini::Ini;
 use log::{debug, info};
-use regex;
+use regex::Regex;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -22,9 +22,9 @@ pub struct Config {
     /// e.g., 33 -> "bang" so '!' is spoken as "bang" not just "exclamation"
     pub symbols: HashMap<u32, String>,
 
-    /// Cached symbols regex for efficient symbol replacement
-    /// Built from symbols dictionary for repeated characters
-    symbols_regex: Option<String>,
+    /// Cached compiled regex for efficient symbol replacement
+    /// Built from symbols dictionary, compiled once on config load
+    symbols_regex: Option<Regex>,
 
     /// Plugin bindings (plugin_name -> key)
     /// Maps plugin modules to keyboard shortcuts
@@ -166,7 +166,8 @@ impl Config {
 
         if let Some(section) = self.ini.section(Some("commands")) {
             for (plugin, cmd) in section.iter() {
-                self.plugin_commands.insert(plugin.to_string(), cmd.to_string());
+                self.plugin_commands
+                    .insert(plugin.to_string(), cmd.to_string());
             }
         }
 
@@ -210,8 +211,8 @@ impl Config {
             .unwrap_or(default)
     }
 
-    /// Build regex pattern for symbol replacement
-    /// Used by speech output to pronounce symbols
+    /// Build and compile regex for symbol replacement
+    /// Compiled once during config load for efficiency in the hot path
     fn build_symbols_regex(&mut self) {
         if self.symbols.is_empty() {
             return;
@@ -230,13 +231,25 @@ impl Config {
             .join("|");
 
         if !pattern.is_empty() {
-            self.symbols_regex = Some(pattern);
+            // Compile the regex once and cache it
+            match Regex::new(&pattern) {
+                Ok(re) => {
+                    debug!(
+                        "Compiled symbols regex with {} patterns",
+                        self.symbols.len()
+                    );
+                    self.symbols_regex = Some(re);
+                }
+                Err(e) => {
+                    debug!("Failed to compile symbols regex: {}", e);
+                }
+            }
         }
     }
 
-    /// Get symbols regex pattern for replacement
-    pub fn symbols_regex(&self) -> Option<&str> {
-        self.symbols_regex.as_deref()
+    /// Get the compiled symbols regex for replacement
+    pub fn symbols_regex(&self) -> Option<&Regex> {
+        self.symbols_regex.as_ref()
     }
 
     // Screen reader-specific configuration getters
@@ -294,9 +307,7 @@ impl Config {
 
     /// Voice index for TTS engine
     pub fn voice_idx(&self) -> Option<usize> {
-        self.get_int("speech", "voice_idx", -1)
-            .try_into()
-            .ok()
+        self.get_int("speech", "voice_idx", -1).try_into().ok()
     }
 
     /// Prompt pattern for plugin line collection
@@ -307,7 +318,10 @@ impl Config {
 
     /// Cursor tracking delay in seconds
     /// How long to wait after cursor movement before speaking
+    /// Config file stores value in milliseconds for user convenience
     pub fn cursor_delay(&self) -> f32 {
-        self.get_float("speech", "cursor_delay", 0.02)
+        // Config stores milliseconds, convert to seconds for internal use
+        let ms = self.get_float("speech", "cursor_delay", 20.0);
+        ms / 1000.0
     }
 }

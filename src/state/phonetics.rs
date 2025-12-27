@@ -3,8 +3,8 @@
 //! When user asks for phonetic spelling (alt+comma twice), we use the
 //! NATO phonetic alphabet to clarify which letter was spoken.
 
-use std::collections::HashMap;
 use once_cell::sync::Lazy;
+use std::collections::HashMap;
 
 /// NATO phonetic alphabet
 ///

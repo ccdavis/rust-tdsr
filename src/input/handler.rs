@@ -22,7 +22,12 @@ pub trait KeyHandler {
 
     /// Process a key with access to state and emulator
     /// Modal handlers can override this for full access
-    fn process_with_context(&mut self, key: &[u8], _state: &mut State, _emulator: &mut Emulator) -> Result<HandlerAction> {
+    fn process_with_context(
+        &mut self,
+        key: &[u8],
+        _state: &mut State,
+        _emulator: &mut Emulator,
+    ) -> Result<HandlerAction> {
         self.process(key)
     }
 
@@ -56,7 +61,12 @@ impl HandlerStack {
     }
 
     /// Process a key with the top handler (with state and emulator access)
-    pub fn process_with_context(&mut self, key: &[u8], state: &mut State, emulator: &mut Emulator) -> Result<HandlerAction> {
+    pub fn process_with_context(
+        &mut self,
+        key: &[u8],
+        state: &mut State,
+        emulator: &mut Emulator,
+    ) -> Result<HandlerAction> {
         if let Some(handler) = self.handlers.last_mut() {
             let action = handler.process_with_context(key, state, emulator)?;
             if action == HandlerAction::Remove {

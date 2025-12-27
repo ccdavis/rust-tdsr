@@ -4,8 +4,8 @@
 //! Allows user to change speech rate, volume, symbol processing, etc.
 
 use super::{HandlerAction, KeyHandler};
-use crate::terminal::Emulator;
 use crate::state::State;
+use crate::terminal::Emulator;
 use crate::Result;
 use log::debug;
 
@@ -46,13 +46,13 @@ impl ConfigHandler {
                 debug!("Config: rate");
                 state.speak("rate")?;
                 // Push BufferHandler to collect numeric input
-                state.handlers.push(Box::new(
-                    super::buffer_handler::BufferHandler::new(Box::new(
-                        move |input: String, state: &mut State| {
+                state
+                    .handlers
+                    .push(Box::new(super::buffer_handler::BufferHandler::new(
+                        Box::new(move |input: String, state: &mut State| {
                             Self::set_rate(input, state)
-                        },
-                    )),
-                ));
+                        }),
+                    )));
                 Ok(HandlerAction::Handled)
             }
 
@@ -60,13 +60,13 @@ impl ConfigHandler {
             b"v" => {
                 debug!("Config: volume");
                 state.speak("volume")?;
-                state.handlers.push(Box::new(
-                    super::buffer_handler::BufferHandler::new(Box::new(
-                        move |input: String, state: &mut State| {
+                state
+                    .handlers
+                    .push(Box::new(super::buffer_handler::BufferHandler::new(
+                        Box::new(move |input: String, state: &mut State| {
                             Self::set_volume(input, state)
-                        },
-                    )),
-                ));
+                        }),
+                    )));
                 Ok(HandlerAction::Handled)
             }
 
@@ -74,13 +74,13 @@ impl ConfigHandler {
             b"V" => {
                 debug!("Config: voice index");
                 state.speak("voice")?;
-                state.handlers.push(Box::new(
-                    super::buffer_handler::BufferHandler::new(Box::new(
-                        move |input: String, state: &mut State| {
+                state
+                    .handlers
+                    .push(Box::new(super::buffer_handler::BufferHandler::new(
+                        Box::new(move |input: String, state: &mut State| {
                             Self::set_voice_idx(input, state)
-                        },
-                    )),
-                ));
+                        }),
+                    )));
                 Ok(HandlerAction::Handled)
             }
 
@@ -89,9 +89,15 @@ impl ConfigHandler {
                 debug!("Config: toggle process symbols");
                 let current = state.config.process_symbols();
                 let new_value = !current;
-                state.config.set("speech", "process_symbols", &new_value.to_string());
+                state
+                    .config
+                    .set("speech", "process_symbols", &new_value.to_string());
                 state.save_config()?;
-                state.speak(if new_value { "process symbols on" } else { "process symbols off" })?;
+                state.speak(if new_value {
+                    "process symbols on"
+                } else {
+                    "process symbols off"
+                })?;
                 Ok(HandlerAction::Handled)
             }
 
@@ -99,13 +105,13 @@ impl ConfigHandler {
             b"d" => {
                 debug!("Config: cursor delay");
                 state.speak("delay")?;
-                state.handlers.push(Box::new(
-                    super::buffer_handler::BufferHandler::new(Box::new(
-                        move |input: String, state: &mut State| {
+                state
+                    .handlers
+                    .push(Box::new(super::buffer_handler::BufferHandler::new(
+                        Box::new(move |input: String, state: &mut State| {
                             Self::set_cursor_delay(input, state)
-                        },
-                    )),
-                ));
+                        }),
+                    )));
                 Ok(HandlerAction::Handled)
             }
 
@@ -114,9 +120,15 @@ impl ConfigHandler {
                 debug!("Config: toggle key echo");
                 let current = state.config.key_echo();
                 let new_value = !current;
-                state.config.set("speech", "key_echo", &new_value.to_string());
+                state
+                    .config
+                    .set("speech", "key_echo", &new_value.to_string());
                 state.save_config()?;
-                state.speak(if new_value { "key echo on" } else { "key echo off" })?;
+                state.speak(if new_value {
+                    "key echo on"
+                } else {
+                    "key echo off"
+                })?;
                 Ok(HandlerAction::Handled)
             }
 
@@ -125,9 +137,15 @@ impl ConfigHandler {
                 debug!("Config: toggle cursor tracking");
                 let current = state.config.cursor_tracking();
                 let new_value = !current;
-                state.config.set("speech", "cursor_tracking", &new_value.to_string());
+                state
+                    .config
+                    .set("speech", "cursor_tracking", &new_value.to_string());
                 state.save_config()?;
-                state.speak(if new_value { "cursor tracking on" } else { "cursor tracking off" })?;
+                state.speak(if new_value {
+                    "cursor tracking on"
+                } else {
+                    "cursor tracking off"
+                })?;
                 Ok(HandlerAction::Handled)
             }
 
@@ -136,9 +154,15 @@ impl ConfigHandler {
                 debug!("Config: toggle line pause");
                 let current = state.config.line_pause();
                 let new_value = !current;
-                state.config.set("speech", "line_pause", &new_value.to_string());
+                state
+                    .config
+                    .set("speech", "line_pause", &new_value.to_string());
                 state.save_config()?;
-                state.speak(if new_value { "line pause on" } else { "line pause off" })?;
+                state.speak(if new_value {
+                    "line pause on"
+                } else {
+                    "line pause off"
+                })?;
                 Ok(HandlerAction::Handled)
             }
 
@@ -147,9 +171,15 @@ impl ConfigHandler {
                 debug!("Config: toggle repeated symbols");
                 let current = state.config.repeated_symbols();
                 let new_value = !current;
-                state.config.set("speech", "repeated_symbols", &new_value.to_string());
+                state
+                    .config
+                    .set("speech", "repeated_symbols", &new_value.to_string());
                 state.save_config()?;
-                state.speak(if new_value { "repeated symbols on" } else { "repeated symbols off" })?;
+                state.speak(if new_value {
+                    "repeated symbols on"
+                } else {
+                    "repeated symbols off"
+                })?;
                 Ok(HandlerAction::Handled)
             }
 
@@ -223,15 +253,15 @@ impl ConfigHandler {
 
     /// Set cursor delay from user input (in milliseconds)
     fn set_cursor_delay(input: String, state: &mut State) -> Result<()> {
-        match input.parse::<f32>() {
-            Ok(ms) if ms >= 0.0 => {
-                let seconds = ms / 1000.0;
-                debug!("Setting cursor delay to {} seconds", seconds);
-                state.config.set("speech", "cursor_delay", &seconds.to_string());
+        match input.parse::<u32>() {
+            Ok(ms) => {
+                debug!("Setting cursor delay to {} milliseconds", ms);
+                // Store as milliseconds directly - getter converts to seconds
+                state.config.set("speech", "cursor_delay", &ms.to_string());
                 state.save_config()?;
                 state.speak("confirmed")?;
             }
-            _ => {
+            Err(_) => {
                 debug!("Invalid cursor delay value: {}", input);
                 state.speak("invalid")?;
             }
@@ -246,7 +276,12 @@ impl KeyHandler for ConfigHandler {
         Ok(HandlerAction::Handled)
     }
 
-    fn process_with_context(&mut self, key: &[u8], state: &mut State, _emulator: &mut Emulator) -> Result<HandlerAction> {
+    fn process_with_context(
+        &mut self,
+        key: &[u8],
+        state: &mut State,
+        _emulator: &mut Emulator,
+    ) -> Result<HandlerAction> {
         self.process_with_state(key, state)
     }
 }

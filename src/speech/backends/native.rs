@@ -7,7 +7,7 @@
 //!
 //! This eliminates the need for Python subprocesses and their dependencies.
 
-use crate::speech::{Synth, SpeechCommand};
+use crate::speech::{SpeechCommand, Synth};
 use crate::{Result, TdsrError};
 use log::{debug, error, warn};
 use tts::Tts as TtsCrate;
@@ -121,7 +121,8 @@ impl Synth for NativeSynth {
         self.voice_idx = Some(idx);
 
         // Get available voices
-        let voices = self.tts
+        let voices = self
+            .tts
             .voices()
             .map_err(|e| TdsrError::Speech(format!("Failed to get voices: {}", e)))?;
 
@@ -131,7 +132,11 @@ impl Synth for NativeSynth {
                 .set_voice(voice)
                 .map_err(|e| TdsrError::Speech(format!("Failed to set voice: {}", e)))?;
         } else {
-            warn!("Voice index {} out of range (have {} voices)", idx, voices.len());
+            warn!(
+                "Voice index {} out of range (have {} voices)",
+                idx,
+                voices.len()
+            );
         }
 
         Ok(())
@@ -143,12 +148,10 @@ impl Synth for NativeSynth {
         }
 
         debug!("Speaking: {}", text);
-        self.tts
-            .speak(text, false)
-            .map_err(|e| {
-                error!("Failed to speak: {}", e);
-                TdsrError::Speech(format!("Speak failed: {}", e))
-            })?;
+        self.tts.speak(text, false).map_err(|e| {
+            error!("Failed to speak: {}", e);
+            TdsrError::Speech(format!("Speak failed: {}", e))
+        })?;
 
         Ok(())
     }
@@ -162,24 +165,20 @@ impl Synth for NativeSynth {
         // We'll use speak() with the character
         // TODO: Consider adding pauses or using SSML if supported
         debug!("Speaking letter: {}", text);
-        self.tts
-            .speak(text, false)
-            .map_err(|e| {
-                error!("Failed to speak letter: {}", e);
-                TdsrError::Speech(format!("Letter speak failed: {}", e))
-            })?;
+        self.tts.speak(text, false).map_err(|e| {
+            error!("Failed to speak letter: {}", e);
+            TdsrError::Speech(format!("Letter speak failed: {}", e))
+        })?;
 
         Ok(())
     }
 
     fn cancel(&mut self) -> Result<()> {
         debug!("Canceling speech");
-        self.tts
-            .stop()
-            .map_err(|e| {
-                error!("Failed to cancel speech: {}", e);
-                TdsrError::Speech(format!("Cancel failed: {}", e))
-            })?;
+        self.tts.stop().map_err(|e| {
+            error!("Failed to cancel speech: {}", e);
+            TdsrError::Speech(format!("Cancel failed: {}", e))
+        })?;
 
         Ok(())
     }

@@ -13,7 +13,7 @@
 //! - v<volume>: Set volume (0-100)
 //! - V<idx>: Set voice by index
 
-use crate::speech::{Synth, SpeechCommand};
+use crate::speech::{SpeechCommand, Synth};
 use crate::{Result, TdsrError};
 use log::{debug, error};
 use std::io::Write;
@@ -52,7 +52,7 @@ impl WindowsSynth {
 
         let mut synth = Self {
             process: None,
-            rate: 50,  // Default rate
+            rate: 50,   // Default rate
             volume: 80, // Default volume
             powershell_path,
         };
@@ -86,7 +86,7 @@ impl WindowsSynth {
         }
 
         Err(TdsrError::Speech(
-            "PowerShell not found. WSL interop may not be enabled.".to_string()
+            "PowerShell not found. WSL interop may not be enabled.".to_string(),
         ))
     }
 
@@ -200,7 +200,10 @@ while ($line = [Console]::ReadLine()) {
                 TdsrError::Speech(format!("Failed to start speech process: {}", e))
             })?;
 
-        debug!("PowerShell speech process started with PID: {:?}", child.id());
+        debug!(
+            "PowerShell speech process started with PID: {:?}",
+            child.id()
+        );
         self.process = Some(child);
         Ok(())
     }
@@ -209,19 +212,19 @@ while ($line = [Console]::ReadLine()) {
     fn send_command(&mut self, cmd: &str) -> Result<()> {
         if let Some(ref mut child) = self.process {
             if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, "{}", cmd)
-                    .map_err(|e| {
-                        error!("Failed to write command to speech process: {}", e);
-                        TdsrError::Speech(format!("Failed to send command: {}", e))
-                    })?;
-                stdin.flush()
-                    .map_err(|e| {
-                        error!("Failed to flush stdin: {}", e);
-                        TdsrError::Speech(format!("Failed to flush command: {}", e))
-                    })?;
+                writeln!(stdin, "{}", cmd).map_err(|e| {
+                    error!("Failed to write command to speech process: {}", e);
+                    TdsrError::Speech(format!("Failed to send command: {}", e))
+                })?;
+                stdin.flush().map_err(|e| {
+                    error!("Failed to flush stdin: {}", e);
+                    TdsrError::Speech(format!("Failed to flush command: {}", e))
+                })?;
                 Ok(())
             } else {
-                Err(TdsrError::Speech("Speech process stdin not available".to_string()))
+                Err(TdsrError::Speech(
+                    "Speech process stdin not available".to_string(),
+                ))
             }
         } else {
             Err(TdsrError::Speech("Speech process not running".to_string()))

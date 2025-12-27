@@ -9,19 +9,21 @@ pub mod phonetics;
 use crate::input::HandlerStack;
 use crate::plugins::PluginManager;
 use crate::review::ReviewCursor;
-use crate::speech::{Synth, SpeechBuffer};
+use crate::speech::{SpeechBuffer, Synth};
 use crate::terminal::Screen;
 use crate::Result;
 use config::Config;
 use log::info;
 use phonetics::PHONETICS;
-use regex::Regex;
-use unicode_width::UnicodeWidthChar;
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthChar;
 
 /// Type for delayed functions (used for cursor tracking)
 /// Stores a function to call and when it should be called
-type DelayedFunction = (Instant, Box<dyn FnOnce(&mut State, &Screen) -> Result<()> + Send>);
+type DelayedFunction = (
+    Instant,
+    Box<dyn FnOnce(&mut State, &Screen) -> Result<()> + Send>,
+);
 
 /// Main application state for the screen reader
 ///
@@ -71,6 +73,11 @@ pub struct State {
     /// Last command executed (for plugin filtering)
     /// Some plugins only trigger after specific commands
     pub last_command: String,
+
+    /// Last key typed by user (for key echo)
+    /// When terminal echoes this character back and key_echo is enabled,
+    /// we speak the character
+    pub last_key: Option<char>,
 
     /// Plugin manager for executing external plugins
     /// Allows custom output parsing and speech generation
@@ -130,7 +137,10 @@ impl State {
                 &prompt_pattern,
             ) {
                 Ok(pm) => {
-                    info!("Plugin manager initialized with {} plugins", config.plugins.len());
+                    info!(
+                        "Plugin manager initialized with {} plugins",
+                        config.plugins.len()
+                    );
                     Some(pm)
                 }
                 Err(e) => {
@@ -155,6 +165,7 @@ impl State {
             copy_start: None,
             delaying_output: false,
             last_command: String::new(),
+            last_key: None,
             plugin_manager,
             delayed_functions: Vec::new(),
         })
@@ -219,15 +230,24 @@ impl State {
         Ok(())
     }
 
-    /// Copy text from a rectangular region of the screen
+    /// Copy text from a linear region of the screen
     ///
-    /// Handles coordinate ordering (start can be after end) and multi-line selections
-    fn copy_text_range(&self, screen: &Screen, mut start_x: u16, mut start_y: u16, mut end_x: u16, mut end_y: u16) -> String {
-        // Normalize coordinates so start is before end
-        if start_x > end_x {
+    /// Performs a linear (stream) selection from start to end position,
+    /// like selecting text in a word processor. Multi-line selections
+    /// include the end of the first line, full middle lines, and the
+    /// beginning of the last line.
+    fn copy_text_range(
+        &self,
+        screen: &Screen,
+        mut start_x: u16,
+        mut start_y: u16,
+        mut end_x: u16,
+        mut end_y: u16,
+    ) -> String {
+        // Normalize so start is before end in reading order (row-major)
+        // Important: swap both x and y together to maintain the linear selection
+        if start_y > end_y || (start_y == end_y && start_x > end_x) {
             std::mem::swap(&mut start_x, &mut end_x);
-        }
-        if start_y > end_y {
             std::mem::swap(&mut start_y, &mut end_y);
         }
 
@@ -235,7 +255,12 @@ impl State {
         let (cols, _) = screen.size;
 
         for y in start_y..=end_y {
+            // On first row: start from start_x
+            // On subsequent rows: start from column 0
             let line_start = if y == start_y { start_x } else { 0 };
+
+            // On last row: end at end_x
+            // On earlier rows: end at last column
             let line_end = if y == end_y { end_x } else { cols - 1 };
 
             // Get characters from this line
@@ -279,18 +304,40 @@ impl State {
         Ok(())
     }
 
+    /// Speak a single character (for key echo)
+    ///
+    /// Uses the TTS "letter" mode if available, or falls back to
+    /// speaking the character's name for special characters.
+    pub fn speak_char(&mut self, ch: char) -> Result<()> {
+        if self.quiet {
+            return Ok(());
+        }
+
+        // For special characters, use their symbol name
+        if let Some(name) = self.config.symbols.get(&(ch as u32)) {
+            self.synth.letter(name)?;
+        } else {
+            // Use letter mode for regular characters
+            self.synth.letter(&ch.to_string())?;
+        }
+        Ok(())
+    }
+
     /// Process symbols in text if enabled
     ///
     /// Converts special characters to their word equivalents
     /// (e.g., "!" → "bang", "$" → "dollar")
+    ///
+    /// Uses pre-compiled regex from Config for efficiency in the hot path.
     fn process_symbols_in_text(&self, text: &str) -> String {
         if !self.config.process_symbols() {
             return text.to_string();
         }
 
-        if let Some(symbols_re) = self.config.symbols_regex() {
-            if let Ok(re) = Regex::new(symbols_re) {
-                return re.replace_all(text, |caps: &regex::Captures| {
+        // Use the pre-compiled regex from config
+        if let Some(re) = self.config.symbols_regex() {
+            return re
+                .replace_all(text, |caps: &regex::Captures| {
                     // Safe unwrap: get(0) always exists in a capture, and we matched at least one char
                     if let Some(matched) = caps.get(0) {
                         if let Some(ch) = matched.as_str().chars().next() {
@@ -302,9 +349,10 @@ impl State {
                         }
                     }
                     // Fallback: return the original match
-                    caps.get(0).map_or(String::new(), |m| m.as_str().to_string())
-                }).to_string();
-            }
+                    caps.get(0)
+                        .map_or(String::new(), |m| m.as_str().to_string())
+                })
+                .to_string();
         }
 
         text.to_string()
@@ -321,7 +369,8 @@ impl State {
 
     /// Get character at current review cursor position
     fn get_char(&self, screen: &Screen) -> char {
-        screen.get_char(self.review.pos.0, self.review.pos.1)
+        screen
+            .get_char(self.review.pos.0, self.review.pos.1)
             .unwrap_or(' ')
     }
 
@@ -381,23 +430,8 @@ impl State {
             return line.to_string();
         }
 
-        let symbols = self.config.repeated_symbols_values();
-        let pattern = format!(r"([{}])\1+", regex::escape(&symbols));
-        if let Ok(re) = Regex::new(&pattern) {
-            re.replace_all(line, |caps: &regex::Captures| {
-                if let Some(matched) = caps.get(0) {
-                    let char = matched.as_str();
-                    let count = char.len();
-                    let symbol = char.chars().next().unwrap_or('?');
-                    format!("{} {}", count, symbol)
-                } else {
-                    // Fallback (should never happen)
-                    String::new()
-                }
-            }).to_string()
-        } else {
-            line.to_string()
-        }
+        let chars_to_condense = self.config.repeated_symbols_values();
+        crate::symbols::condense_repeated_chars(line, &chars_to_condense, &self.config.symbols)
     }
 
     /// Move to previous line and speak it
@@ -482,8 +516,10 @@ impl State {
         let (cols, _) = screen.size;
 
         // Move to beginning of word
-        while self.review.pos.0 > 0 && self.get_char(screen) != ' '
-            && screen.get_char(self.review.pos.0 - 1, self.review.pos.1) != Some(' ') {
+        while self.review.pos.0 > 0
+            && self.get_char(screen) != ' '
+            && screen.get_char(self.review.pos.0 - 1, self.review.pos.1) != Some(' ')
+        {
             self.move_prevchar(screen);
         }
 
@@ -546,8 +582,10 @@ impl State {
         }
 
         // Move to beginning of the word we're now on
-        while self.review.pos.0 > 0 && self.get_char(screen) != ' '
-            && screen.get_char(self.review.pos.0 - 1, self.review.pos.1) != Some(' ') {
+        while self.review.pos.0 > 0
+            && self.get_char(screen) != ' '
+            && screen.get_char(self.review.pos.0 - 1, self.review.pos.1) != Some(' ')
+        {
             self.move_prevchar(screen);
         }
 
@@ -695,10 +733,7 @@ impl State {
         }
 
         let now = Instant::now();
-        let next = self.delayed_functions
-            .iter()
-            .map(|(when, _)| *when)
-            .min()?;
+        let next = self.delayed_functions.iter().map(|(when, _)| *when).min()?;
 
         Some(next.saturating_duration_since(now))
     }
@@ -710,5 +745,148 @@ impl State {
         if self.config.cursor_tracking() {
             self.review.pos = cursor;
         }
+    }
+
+    /// Adjust review cursor after screen scrolling
+    ///
+    /// When the screen scrolls, the review cursor should move to stay with
+    /// the same content (or clamp to screen bounds if content scrolled off).
+    ///
+    /// scroll_offset: positive = scrolled up (move review cursor up to follow content)
+    ///                negative = scrolled down (move review cursor down to follow content)
+    pub fn adjust_review_cursor_for_scroll(&mut self, scroll_offset: i16, rows: u16) {
+        if scroll_offset == 0 {
+            return;
+        }
+
+        let (x, y) = self.review.pos;
+        let new_y = if scroll_offset > 0 {
+            // Content scrolled up - review cursor should move up to follow
+            y.saturating_sub(scroll_offset as u16)
+        } else {
+            // Content scrolled down - review cursor should move down to follow
+            let offset = (-scroll_offset) as u16;
+            (y + offset).min(rows.saturating_sub(1))
+        };
+
+        self.review.pos = (x, new_y);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::terminal::Screen;
+
+    /// Test helper to create a screen with test content
+    fn create_test_screen() -> Screen {
+        let mut screen = Screen::new(10, 5);
+        // Fill with recognizable content:
+        // Row 0: "AAAAAAAAAA"
+        // Row 1: "BBBBBBBBBB"
+        // Row 2: "CCCCCCCCCC"
+        // Row 3: "DDDDDDDDDD"
+        // Row 4: "EEEEEEEEEE"
+        for y in 0..5 {
+            let ch = (b'A' + y as u8) as char;
+            for x in 0..10 {
+                screen.buffer[y][x].data = ch;
+            }
+        }
+        screen
+    }
+
+    /// Test helper to extract text from screen using the same logic as copy_text_range
+    fn extract_text(screen: &Screen, start_x: u16, start_y: u16, end_x: u16, end_y: u16) -> String {
+        let mut start_x = start_x;
+        let mut start_y = start_y;
+        let mut end_x = end_x;
+        let mut end_y = end_y;
+
+        // Same normalization logic as copy_text_range
+        if start_y > end_y || (start_y == end_y && start_x > end_x) {
+            std::mem::swap(&mut start_x, &mut end_x);
+            std::mem::swap(&mut start_y, &mut end_y);
+        }
+
+        let mut text = String::new();
+        let (cols, _) = screen.size;
+
+        for y in start_y..=end_y {
+            let line_start = if y == start_y { start_x } else { 0 };
+            let line_end = if y == end_y { end_x } else { cols - 1 };
+
+            for x in line_start..=line_end {
+                if let Some(ch) = screen.get_char(x, y) {
+                    if ch != '\0' {
+                        text.push(ch);
+                    }
+                }
+            }
+
+            if y < end_y {
+                text.push('\n');
+            }
+        }
+
+        text
+    }
+
+    #[test]
+    fn test_linear_selection_single_line() {
+        let screen = create_test_screen();
+
+        // Select part of row 1: columns 2-5
+        let text = extract_text(&screen, 2, 1, 5, 1);
+        assert_eq!(text, "BBBB");
+    }
+
+    #[test]
+    fn test_linear_selection_multi_line() {
+        let screen = create_test_screen();
+
+        // Select from row 1, col 5 to row 2, col 3
+        // Should get: "BBBBB" (5-9 of row 1) + "\n" + "CCCC" (0-3 of row 2)
+        let text = extract_text(&screen, 5, 1, 3, 2);
+        assert_eq!(text, "BBBBB\nCCCC");
+    }
+
+    #[test]
+    fn test_linear_selection_backwards() {
+        let screen = create_test_screen();
+
+        // Select backwards: from row 2, col 3 to row 1, col 5
+        // Should give same result as forward selection
+        let text = extract_text(&screen, 3, 2, 5, 1);
+        assert_eq!(text, "BBBBB\nCCCC");
+    }
+
+    #[test]
+    fn test_linear_selection_full_lines() {
+        let screen = create_test_screen();
+
+        // Select from row 1, col 0 to row 2, col 9 (full two lines)
+        let text = extract_text(&screen, 0, 1, 9, 2);
+        assert_eq!(text, "BBBBBBBBBB\nCCCCCCCCCC");
+    }
+
+    #[test]
+    fn test_linear_selection_three_lines() {
+        let screen = create_test_screen();
+
+        // Select from row 1, col 7 to row 3, col 2
+        // Row 1: cols 7-9 = "BBB"
+        // Row 2: full line = "CCCCCCCCCC"
+        // Row 3: cols 0-2 = "DDD"
+        let text = extract_text(&screen, 7, 1, 2, 3);
+        assert_eq!(text, "BBB\nCCCCCCCCCC\nDDD");
+    }
+
+    #[test]
+    fn test_linear_selection_single_char() {
+        let screen = create_test_screen();
+
+        // Select single character
+        let text = extract_text(&screen, 5, 2, 5, 2);
+        assert_eq!(text, "C");
     }
 }

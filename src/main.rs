@@ -62,7 +62,10 @@ fn main() {
             }
         }
 
-        info!("TDSR version {} starting (debug mode, logging to tdsr.log)", tdsr::VERSION);
+        info!(
+            "TDSR version {} starting (debug mode, logging to tdsr.log)",
+            tdsr::VERSION
+        );
     } else {
         // Normal mode: minimal logging to stderr, only errors
         env_logger::Builder::from_default_env()
@@ -109,19 +112,12 @@ fn run() -> Result<()> {
         .skip(1)
         .filter(|arg| arg != "--debug" && arg != "-d")
         .collect();
-    let program = if args.is_empty() {
-        None
-    } else {
-        Some(args)
-    };
+    let program = if args.is_empty() { None } else { Some(args) };
 
     // Load configuration and initialize state
     // State holds all screen reader settings and UI state
     let mut state = State::new(cols, rows)?;
-    info!(
-        "State initialized - config from {:?}",
-        state.config.path()
-    );
+    info!("State initialized - config from {:?}", state.config.path());
 
     // Create PTY and spawn shell
     // This is the core of the screen reader - we sit between user and shell
@@ -135,18 +131,17 @@ fn run() -> Result<()> {
     // Create default key handler for screen reader commands
     // This processes Alt+key combinations for navigation
     let keymap = create_default_keymap();
+    info!("Key handler initialized with {} bindings", keymap.len());
     let mut default_handler = DefaultKeyHandler::new(keymap);
-    info!("Key handler initialized with {} bindings", create_default_keymap().len());
 
     // Set up signal handler for window resize
     unsafe {
-        signal::signal(Signal::SIGWINCH, SigHandler::Handler(handle_sigwinch))
-            .map_err(|e| tdsr::TdsrError::Io(
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to set SIGWINCH handler: {}", e)
-                )
-            ))?;
+        signal::signal(Signal::SIGWINCH, SigHandler::Handler(handle_sigwinch)).map_err(|e| {
+            tdsr::TdsrError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to set SIGWINCH handler: {}", e),
+            ))
+        })?;
     }
 
     // Set up event loop
@@ -243,7 +238,9 @@ fn run() -> Result<()> {
             match select(None, Some(&mut read_fds), None, None, Some(&mut timeout)) {
                 Ok(_n) => {
                     if read_fds.contains(stdin_borrowed) {
-                        if let Err(e) = handle_stdin(&mut pty, &mut state, &mut emulator, &mut default_handler) {
+                        if let Err(e) =
+                            handle_stdin(&mut pty, &mut state, &mut emulator, &mut default_handler)
+                        {
                             error!("stdin error: {}", e);
                             return Ok(());
                         }
@@ -274,7 +271,8 @@ fn run() -> Result<()> {
         } else if let Some((ref mut poll, ref mut events)) = mio_poll {
             // Regular mode: Use mio for I/O monitoring
             // Calculate timeout based on scheduled functions or use default
-            let timeout = state.time_until_next_scheduled()
+            let timeout = state
+                .time_until_next_scheduled()
                 .map(|d| d.min(std::time::Duration::from_millis(100)))
                 .or(Some(std::time::Duration::from_millis(100)));
 
@@ -283,7 +281,9 @@ fn run() -> Result<()> {
             for event in events.iter() {
                 match event.token() {
                     STDIN => {
-                        if let Err(e) = handle_stdin(&mut pty, &mut state, &mut emulator, &mut default_handler) {
+                        if let Err(e) =
+                            handle_stdin(&mut pty, &mut state, &mut emulator, &mut default_handler)
+                        {
                             error!("stdin error: {}", e);
                             return Ok(());
                         }
@@ -339,6 +339,15 @@ fn handle_stdin(
                 HandlerAction::Passthrough => {
                     // Push handler back (it wants to stay active)
                     state.handlers.push(handler);
+                    // Track the last key for key_echo feature
+                    if input.len() == 1 {
+                        let ch = input[0] as char;
+                        if ch.is_ascii_graphic() || ch == ' ' {
+                            state.last_key = Some(ch);
+                        }
+                    } else {
+                        state.last_key = None;
+                    }
                     // Pass key through to shell
                     pty.write(input)?;
                 }
@@ -360,6 +369,16 @@ fn handle_stdin(
     match action {
         HandlerAction::Passthrough => {
             // Not a screen reader command - pass to shell
+            // Track the last key for key_echo feature
+            if input.len() == 1 {
+                let ch = input[0] as char;
+                if ch.is_ascii_graphic() || ch == ' ' {
+                    state.last_key = Some(ch);
+                }
+            } else {
+                // Multi-byte input (escape sequence, etc.) - clear last key
+                state.last_key = None;
+            }
             pty.write(input)?;
         }
         HandlerAction::Handled => {
@@ -397,10 +416,46 @@ fn handle_pty_output(pty: &mut Pty, emulator: &mut Emulator, state: &mut State) 
     // Parse output and update screen buffer + speech buffer
     // If quiet mode or temp_silence is active, don't add to speech
     if !state.quiet && !state.temp_silence {
-        emulator.process_with_speech(output, &mut state.speech_buffer, &mut state.last_drawn)?;
+        let line_pause = state.config.line_pause();
+        let key_echo = state.config.key_echo();
+        let last_key = state.last_key;
 
-        // Flush speech buffer to TTS if we have content
-        // In quiet mode or when delaying output (cursor tracking), speech is suppressed
+        emulator.process_with_speech(
+            output,
+            &mut state.speech_buffer,
+            &mut state.last_drawn,
+            line_pause,
+        )?;
+
+        // Key echo: if output is just the last typed character being echoed,
+        // speak it as a character (phonetically) instead of normal speech
+        if key_echo {
+            if let Some(typed_key) = last_key {
+                // Check if output is just the single character we typed
+                // (terminals typically echo the character immediately)
+                if output.len() == 1 && output[0] as char == typed_key {
+                    // Speak the character and skip normal speech buffer
+                    state.speak_char(typed_key)?;
+                    state.speech_buffer.flush(); // Discard the character from buffer
+                    state.last_key = None;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Clear last_key after processing (echo window has passed)
+        state.last_key = None;
+
+        // If line_pause is enabled, speak each line separately
+        if line_pause && state.speech_buffer.has_pending_lines() {
+            for line in state.speech_buffer.drain_lines() {
+                if !line.is_empty() {
+                    state.speak(&line)?;
+                }
+            }
+        }
+
+        // Flush any remaining buffer content to TTS
         if !state.speech_buffer.is_empty() {
             let text = state.speech_buffer.flush();
             state.speak(&text)?;
@@ -408,6 +463,13 @@ fn handle_pty_output(pty: &mut Pty, emulator: &mut Emulator, state: &mut State) 
     } else {
         // Quiet mode - just update screen buffer without speech
         emulator.process(output)?;
+    }
+
+    // Adjust review cursor for any scrolling that occurred
+    let scroll_offset = emulator.screen_mut().take_scroll_offset();
+    if scroll_offset != 0 {
+        let rows = emulator.screen().size.1;
+        state.adjust_review_cursor_for_scroll(scroll_offset, rows);
     }
 
     // Update review cursor if cursor tracking is enabled and cursor moved

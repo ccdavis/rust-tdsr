@@ -49,8 +49,12 @@ fn main() {
     println!("✓ Volume control test passed");
 
     println!("\nTesting special characters...");
-    synth.speak("Testing punctuation: Hello, world! How are you?").ok();
-    synth.speak("Testing quotes: It's a test with 'single' and \"double\" quotes").ok();
+    synth
+        .speak("Testing punctuation: Hello, world! How are you?")
+        .ok();
+    synth
+        .speak("Testing quotes: It's a test with 'single' and \"double\" quotes")
+        .ok();
     println!("✓ Special character test passed");
 
     println!("\n✓ All tests passed!");

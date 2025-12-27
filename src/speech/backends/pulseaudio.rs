@@ -9,7 +9,7 @@
 //! - PulseAudio client libraries (usually pre-installed with WSLG)
 
 use crate::platform::is_wsl;
-use crate::speech::{Synth, SpeechCommand};
+use crate::speech::{SpeechCommand, Synth};
 use crate::{Result, TdsrError};
 use log::{debug, error, info, warn};
 use std::process::{Child, Command, Stdio};
@@ -48,7 +48,10 @@ impl PulseAudioSynth {
 
         // Try to auto-detect WSLG PulseAudio server
         if std::path::Path::new(WSLG_PULSE_PATH).exists() {
-            info!("Auto-detected WSLG PulseAudio server at {}", WSLG_PULSE_PATH);
+            info!(
+                "Auto-detected WSLG PulseAudio server at {}",
+                WSLG_PULSE_PATH
+            );
             std::env::set_var("PULSE_SERVER", WSLG_PULSE_PATH);
             return Ok(());
         }
@@ -85,8 +88,8 @@ impl PulseAudioSynth {
 
         Ok(Self {
             current_process: None,
-            rate: 50,  // Default rate
-            volume: 80, // Default volume
+            rate: 50,                // Default rate
+            volume: 80,              // Default volume
             voice: "en".to_string(), // Default English voice
             espeak_path,
         })
@@ -110,7 +113,7 @@ impl PulseAudioSynth {
         }
 
         Err(TdsrError::Speech(
-            "espeak-ng not found. Install with: sudo apt install espeak-ng".to_string()
+            "espeak-ng not found. Install with: sudo apt install espeak-ng".to_string(),
         ))
     }
 
@@ -131,16 +134,16 @@ impl PulseAudioSynth {
     /// Get voice name by index
     fn get_voice_by_idx(idx: usize) -> &'static str {
         const VOICES: &[&str] = &[
-            "en",       // 0: Default English
-            "en-us",    // 1: US English
-            "en-gb",    // 2: British English
-            "en-sc",    // 3: Scottish English
-            "es",       // 4: Spanish
-            "fr",       // 5: French
-            "de",       // 6: German
-            "it",       // 7: Italian
-            "pt",       // 8: Portuguese
-            "ru",       // 9: Russian
+            "en",    // 0: Default English
+            "en-us", // 1: US English
+            "en-gb", // 2: British English
+            "en-sc", // 3: Scottish English
+            "es",    // 4: Spanish
+            "fr",    // 5: French
+            "de",    // 6: German
+            "it",    // 7: Italian
+            "pt",    // 8: Portuguese
+            "ru",    // 9: Russian
         ];
 
         VOICES.get(idx).unwrap_or(&"en")
@@ -200,7 +203,10 @@ impl PulseAudioSynth {
             }
             Err(e) => {
                 error!("Failed to spawn espeak-ng: {}", e);
-                Err(TdsrError::Speech(format!("Failed to start espeak-ng: {}", e)))
+                Err(TdsrError::Speech(format!(
+                    "Failed to start espeak-ng: {}",
+                    e
+                )))
             }
         }
     }
@@ -267,8 +273,8 @@ mod tests {
 
     #[test]
     fn test_rate_conversion() {
-        assert_eq!(PulseAudioSynth::rate_to_espeak_speed(0), 80);    // Slowest
-        assert_eq!(PulseAudioSynth::rate_to_espeak_speed(50), 265);  // Normal
+        assert_eq!(PulseAudioSynth::rate_to_espeak_speed(0), 80); // Slowest
+        assert_eq!(PulseAudioSynth::rate_to_espeak_speed(50), 265); // Normal
         assert_eq!(PulseAudioSynth::rate_to_espeak_speed(100), 450); // Fastest
     }
 

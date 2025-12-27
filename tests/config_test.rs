@@ -43,7 +43,23 @@ fn test_config_methods() {
 fn test_cursor_delay() {
     let config = Config::load().expect("Failed to load config");
 
-    // Default cursor delay should be 0.02 seconds (20ms)
+    // Cursor delay should be returned in seconds
+    // Config stores milliseconds, getter converts to seconds
     let delay = config.cursor_delay();
-    assert!(delay > 0.0 && delay < 1.0);
+
+    // Default is 20ms = 0.02 seconds
+    // Should be a reasonable value (less than 1 second)
+    assert!(
+        delay > 0.0 && delay < 1.0,
+        "cursor_delay should be in seconds (0 < {} < 1)",
+        delay
+    );
+
+    // Verify it's not the raw milliseconds (would be >= 1.0 for any practical value)
+    // If config has cursor_delay=300, it should return 0.3, not 300.0
+    assert!(
+        delay < 0.5,
+        "cursor_delay {} seems too high - may not be converting ms to seconds",
+        delay
+    );
 }

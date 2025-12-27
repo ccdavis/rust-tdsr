@@ -1,25 +1,14 @@
 //! Symbol processing and character name lookup
 //!
+//! This module provides utilities for processing special characters in speech output:
+//! - `condense_repeated_chars`: Converts repeated symbols like "====" into "4 equals"
+//!
+//! Note: Symbol-to-name replacement (e.g., "!" → "bang") is handled by
+//! `State::process_symbols_in_text` using a cached compiled regex for efficiency.
+//!
 //! Note: Phonetic alphabet is defined in `state/phonetics.rs` as the `PHONETICS` map.
 
 use std::collections::HashMap;
-
-/// Replace symbols in text with their names
-pub fn process_symbols(text: &str, symbols: &HashMap<u32, String>) -> String {
-    let mut result = String::new();
-
-    for ch in text.chars() {
-        if let Some(name) = symbols.get(&(ch as u32)) {
-            result.push(' ');
-            result.push_str(name);
-            result.push(' ');
-        } else {
-            result.push(ch);
-        }
-    }
-
-    result
-}
 
 /// Replace repeated characters with count + character
 /// e.g., "====" becomes "4 equals"
@@ -49,10 +38,7 @@ pub fn condense_repeated_chars(
 
             if count > 1 {
                 // Get symbol name or use the character itself
-                let char_name = symbols
-                    .get(&(ch as u32))
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
+                let char_name = symbols.get(&(ch as u32)).map(|s| s.as_str()).unwrap_or("");
 
                 if char_name.is_empty() {
                     result.push_str(&format!("{} {}", count, ch));

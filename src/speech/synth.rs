@@ -3,8 +3,8 @@
 //! Provides a unified interface for text-to-speech across platforms.
 //! The screen reader uses this to speak all output to the user.
 
-use crate::Result;
 use crate::platform::is_wsl;
+use crate::Result;
 use log::info;
 
 /// Commands sent to speech backend
@@ -168,7 +168,10 @@ pub fn create_synth() -> Result<Box<dyn Synth>> {
     }
 
     // macOS and other platforms
-    info!("Creating native speech synthesizer for platform: {}", platform);
+    info!(
+        "Creating native speech synthesizer for platform: {}",
+        platform
+    );
     use super::backends::native::NativeSynth;
 
     match NativeSynth::new() {
@@ -176,11 +179,9 @@ pub fn create_synth() -> Result<Box<dyn Synth>> {
             info!("✓ Successfully initialized native TTS backend");
             Ok(Box::new(synth))
         }
-        Err(e) => {
-            Err(crate::TdsrError::Speech(format!(
-                "Failed to initialize speech backend for platform '{}': {}",
-                platform, e
-            )))
-        }
+        Err(e) => Err(crate::TdsrError::Speech(format!(
+            "Failed to initialize speech backend for platform '{}': {}",
+            platform, e
+        ))),
     }
 }

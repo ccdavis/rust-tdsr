@@ -65,10 +65,7 @@ fn test_speech_operations() {
         );
 
         // Test speaking empty string (should be no-op)
-        assert!(
-            synth.speak("").is_ok(),
-            "Should handle empty string"
-        );
+        assert!(synth.speak("").is_ok(), "Should handle empty string");
 
         // Test speaking letter
         assert!(
@@ -77,10 +74,7 @@ fn test_speech_operations() {
         );
 
         // Test cancel
-        assert!(
-            synth.cancel().is_ok(),
-            "Should cancel without error"
-        );
+        assert!(synth.cancel().is_ok(), "Should cancel without error");
 
         println!("✓ Speech operation tests passed");
     } else {
@@ -100,10 +94,7 @@ fn test_speech_unicode() {
             "Should handle CJK characters"
         );
 
-        assert!(
-            synth.speak("Emoji: 🎤").is_ok(),
-            "Should handle emoji"
-        );
+        assert!(synth.speak("Emoji: 🎤").is_ok(), "Should handle emoji");
 
         assert!(
             synth.speak("Accents: café naïve").is_ok(),
@@ -123,11 +114,7 @@ fn test_speech_rate_sequence() {
 
     if let Ok(mut synth) = result {
         for rate in [25, 50, 75, 100] {
-            assert!(
-                synth.set_rate(rate).is_ok(),
-                "Should set rate to {}",
-                rate
-            );
+            assert!(synth.set_rate(rate).is_ok(), "Should set rate to {}", rate);
         }
 
         println!("✓ Rate sequence test passed");

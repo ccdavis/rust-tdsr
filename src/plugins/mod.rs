@@ -61,16 +61,16 @@ impl PluginManager {
         plugin_dir: PathBuf,
         prompt_pattern: &str,
     ) -> Result<Self> {
-        let prompt_regex = Regex::new(prompt_pattern)
-            .unwrap_or_else(|_| {
-                // This should never fail as ".*" is always valid
-                Regex::new(".*").expect("Failed to compile fallback regex")
-            });
+        let prompt_regex = Regex::new(prompt_pattern).unwrap_or_else(|_| {
+            // This should never fail as ".*" is always valid
+            Regex::new(".*").expect("Failed to compile fallback regex")
+        });
 
         let mut plugin_configs = HashMap::new();
 
         for (name, key) in plugins {
-            let command_filter = plugin_commands.get(&name)
+            let command_filter = plugin_commands
+                .get(&name)
                 .and_then(|pattern| Regex::new(pattern).ok());
 
             plugin_configs.insert(
@@ -83,7 +83,10 @@ impl PluginManager {
             );
         }
 
-        debug!("Plugin manager initialized with {} plugins", plugin_configs.len());
+        debug!(
+            "Plugin manager initialized with {} plugins",
+            plugin_configs.len()
+        );
 
         Ok(Self {
             plugins: plugin_configs,
@@ -101,7 +104,9 @@ impl PluginManager {
         screen: &Screen,
         last_command: &str,
     ) -> Result<Vec<String>> {
-        let plugin = self.plugins.get(key)
+        let plugin = self
+            .plugins
+            .get(key)
             .ok_or_else(|| format!("Plugin not found for key: {}", key))?;
 
         debug!("Executing plugin: {}", plugin.name);
@@ -161,7 +166,7 @@ impl PluginManager {
 
             // Add directory components
             if path_parts.len() > 1 {
-                for part in &path_parts[..path_parts.len()-1] {
+                for part in &path_parts[..path_parts.len() - 1] {
                     path.push(part);
                 }
             }

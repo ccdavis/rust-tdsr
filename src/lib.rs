@@ -3,16 +3,16 @@
 //! A console-based screen reader for *nix systems (macOS, Linux, FreeBSD).
 //! Provides text-to-speech feedback for terminal applications.
 
-pub mod error;
-pub mod terminal;
-pub mod speech;
-pub mod input;
-pub mod state;
-pub mod review;
 pub mod clipboard;
-pub mod symbols;
-pub mod plugins;
+pub mod error;
+pub mod input;
 pub mod platform;
+pub mod plugins;
+pub mod review;
+pub mod speech;
+pub mod state;
+pub mod symbols;
+pub mod terminal;
 
 pub use error::{Result, TdsrError};
 

@@ -73,7 +73,9 @@ src/
 
 **Speech System** (`speech/`):
 - `Synth` trait defines speak/cancel/set_rate/set_volume/set_voice
-- Backend selection in `synth.rs`: WSL → SAPI/PulseAudio/native; Linux → native/PulseAudio; macOS → native
+- Backend selection in `synth.rs`: WSL → PulseAudio/SAPI/native; Linux → native/PulseAudio; macOS → native
+- PulseAudio backend uses a persistent espeak-ng process (stdin line-by-line mode) for proper speech queuing
+- Supports MBROLA voices (indices 10+) for higher quality speech on Linux/WSL
 - Speech buffer accumulates text, flushed on cursor movement or timer
 
 **Input Handling** (`input/`): Stack-based modal handlers. `HandlerResult::Passthrough` sends key to PTY, `Remove` pops handler.

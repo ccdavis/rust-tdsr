@@ -97,12 +97,16 @@ impl DefaultKeyHandler {
         self.last_key = Some(key.to_vec());
         self.last_key_time = now;
 
-        // Convert key bytes to string for plugin lookup
-        if let Ok(key_str) = String::from_utf8(key.to_vec()) {
-            if state.has_plugin(&key_str) {
-                debug!("Executing plugin for key: {}", key_str);
+        // Check for plugin bindings
+        // Plugin keys are configured as plain characters (e.g., "d") but triggered
+        // via Alt+key. Alt+key arrives as ESC (0x1b) followed by the character,
+        // so we check if the input is an Alt+key sequence and extract the key.
+        if key.len() == 2 && key[0] == 0x1b {
+            let plugin_key = String::from(key[1] as char);
+            if state.has_plugin(&plugin_key) {
+                debug!("Executing plugin for Alt+{}", plugin_key);
                 let screen = emulator.screen();
-                state.execute_plugin(&key_str, screen)?;
+                state.execute_plugin(&plugin_key, screen)?;
                 return Ok(HandlerAction::Handled);
             }
         }
@@ -136,8 +140,13 @@ impl DefaultKeyHandler {
             QuietMode => {
                 let quiet = state.toggle_quiet();
                 debug!("Quiet mode: {}", quiet);
-                let msg = if quiet { "quiet on" } else { "quiet off" };
-                state.speak(msg)?;
+                if quiet {
+                    // Bypass state.speak() since quiet is already true and
+                    // speak() would suppress this confirmation
+                    state.synth.speak("quiet on")?;
+                } else {
+                    state.speak("quiet off")?;
+                }
                 Ok(HandlerAction::Handled)
             }
 

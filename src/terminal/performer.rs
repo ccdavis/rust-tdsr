@@ -39,6 +39,58 @@ impl<'a> ScreenPerformer<'a> {
     }
 }
 
+impl<'a> ScreenPerformer<'a> {
+    /// Handle private CSI modes (CSI ? Pn h/l)
+    ///
+    /// These control terminal modes like alternate screen, cursor visibility, etc.
+    fn handle_private_mode(&mut self, params: &vte::Params, action: char) {
+        let mode = params
+            .iter()
+            .next()
+            .and_then(|p| p.first().copied())
+            .unwrap_or(0);
+
+        match (mode, action) {
+            // CSI ?1049h - Save cursor + switch to alternate screen + clear
+            (1049, 'h') => {
+                trace!("Entering alternate screen mode (1049)");
+                self.screen.save_screen();
+                self.screen.clear();
+                self.screen.cursor = (0, 0);
+            }
+            // CSI ?1049l - Restore from alternate screen + restore cursor
+            (1049, 'l') => {
+                trace!("Leaving alternate screen mode (1049)");
+                self.screen.restore_screen();
+            }
+            // CSI ?47h - Switch to alternate screen (no cursor save)
+            (47, 'h') => {
+                trace!("Entering alternate screen mode (47)");
+                self.screen.save_screen();
+                self.screen.clear();
+            }
+            // CSI ?47l - Restore from alternate screen
+            (47, 'l') => {
+                trace!("Leaving alternate screen mode (47)");
+                self.screen.restore_screen();
+            }
+            // CSI ?1047h/l - Same as 47 but also clears on enter
+            (1047, 'h') => {
+                trace!("Entering alternate screen mode (1047)");
+                self.screen.save_screen();
+                self.screen.clear();
+            }
+            (1047, 'l') => {
+                trace!("Leaving alternate screen mode (1047)");
+                self.screen.restore_screen();
+            }
+            _ => {
+                trace!("Unhandled private mode: ?{}{}", mode, action);
+            }
+        }
+    }
+}
+
 impl<'a> Perform for ScreenPerformer<'a> {
     /// Print a character to the screen
     ///
@@ -52,6 +104,10 @@ impl<'a> Perform for ScreenPerformer<'a> {
     /// - If already at the bottom line, scroll the screen up first
     fn print(&mut self, c: char) {
         let (cols, rows) = self.screen.size;
+        let (_top, bottom) = self
+            .screen
+            .scroll_region
+            .unwrap_or((0, self.screen.size.1 - 1));
 
         // Get character width for proper cursor advancement
         let width = c.width().unwrap_or(1) as u16;
@@ -60,11 +116,11 @@ impl<'a> Perform for ScreenPerformer<'a> {
         // This implements DECAWM (auto-wrap mode) which is enabled by default
         if self.screen.cursor.0 >= cols {
             self.screen.cursor.0 = 0;
-            // Perform linefeed with scrolling
-            if self.screen.cursor.1 >= rows - 1 {
-                // At bottom of screen - scroll up
+            // Perform linefeed with scrolling, respecting scroll region
+            if self.screen.cursor.1 >= bottom {
+                // At bottom of scroll region - scroll up within region
                 self.screen.scroll_up(1);
-                // Cursor stays at bottom row after scroll
+                // Cursor stays at bottom of region after scroll
             } else {
                 self.screen.cursor.1 += 1;
             }
@@ -123,11 +179,14 @@ impl<'a> Perform for ScreenPerformer<'a> {
                     self.speech_buffer.write(" ");
                 }
 
-                let (_, rows) = self.screen.size;
-                if self.screen.cursor.1 >= rows - 1 {
-                    // At bottom of screen - scroll up to make room
+                let (_, bottom) = self
+                    .screen
+                    .scroll_region
+                    .unwrap_or((0, self.screen.size.1 - 1));
+                if self.screen.cursor.1 >= bottom {
+                    // At bottom of scroll region - scroll up to make room
                     self.screen.scroll_up(1);
-                    // Cursor stays at bottom row after scroll
+                    // Cursor stays at bottom of region after scroll
                 } else {
                     self.screen.cursor.1 += 1;
                 }
@@ -165,10 +224,16 @@ impl<'a> Perform for ScreenPerformer<'a> {
     fn csi_dispatch(
         &mut self,
         params: &vte::Params,
-        _intermediates: &[u8],
+        intermediates: &[u8],
         _ignore: bool,
         action: char,
     ) {
+        // Handle private modes (CSI ? Pn h/l)
+        if intermediates.first() == Some(&b'?') {
+            self.handle_private_mode(params, action);
+            return;
+        }
+
         match action {
             // Cursor movement commands
             'H' | 'f' => {

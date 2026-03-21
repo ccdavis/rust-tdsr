@@ -44,11 +44,13 @@ Also, it's nice to have a single binary to deploy wherever you need a talking te
 - Runtime dependencies:
   - Speech Dispatcher: `sudo apt install speech-dispatcher`
   - Clipboard: `xclip` (X11) or `wl-copy` (Wayland)
+  - Optional (better voices): `sudo apt install espeak-ng mbrola mbrola-us1 mbrola-us2`
 
 **WSL (Windows Subsystem for Linux):**
 - Rust 1.70 or later (for building)
 - Build dependencies: same as Linux
-- Runtime: Uses Windows SAPI automatically - no speech-dispatcher needed
+- Runtime: Uses PulseAudio + espeak-ng (via WSLG), falls back to Windows SAPI or Speech Dispatcher
+- Optional (better voices): `sudo apt install mbrola mbrola-us1 mbrola-us2`
 - See [WSL.md](WSL.md) for details
 
 ### Building from Source
@@ -95,15 +97,15 @@ Configuration file: `~/.tdsr.cfg` (INI format)
 ### Speech Settings
 
 TDSR uses native speech synthesis:
-- **Linux:** Speech Dispatcher (ensure `speech-dispatcher` daemon is running)
-- **WSL:** Windows SAPI (automatically detected, no setup needed)
+- **Linux:** Speech Dispatcher, or PulseAudio + espeak-ng as fallback
+- **WSL:** PulseAudio + espeak-ng (via WSLG), Windows SAPI fallback, Speech Dispatcher fallback
 - **macOS:** AVFoundation (built into macOS 10.14+)
 
 ```ini
 [speech]
 rate = 50           # Speech rate: 0 (slowest) to 100 (fastest), default 50
 volume = 80         # Volume: 0 (quietest) to 100 (loudest), default 80
-voice_idx = 0       # Voice index (macOS only, try 0-10 for different voices)
+voice_idx = 0       # Voice index (see voice table below)
 cursor_delay = 300  # Milliseconds before speaking cursor position
 process_symbols = false  # Convert symbols to words
 key_echo = true     # Speak characters as you type
@@ -112,6 +114,47 @@ line_pause = true        # Pause between lines
 repeated_symbols = false
 repeated_symbols_values = -=!#
 prompt = .*         # Regex for prompt (plugin system)
+```
+
+### Voice Selection (Linux / WSL with espeak-ng backend)
+
+Set `voice_idx` in `~/.tdsr.cfg` or change via the config menu (Alt+c → V).
+
+**Built-in espeak-ng voices (always available):**
+
+| Index | Voice | Description |
+|-------|-------|-------------|
+| 0 | en | Default English |
+| 1 | en-us | US English |
+| 2 | en-gb | British English |
+| 3 | en-sc | Scottish English |
+| 4 | es | Spanish |
+| 5 | fr | French |
+| 6 | de | German |
+| 7 | it | Italian |
+| 8 | pt | Portuguese |
+| 9 | ru | Russian |
+
+**MBROLA voices (higher quality, require additional packages):**
+
+| Index | Voice | Description | Package |
+|-------|-------|-------------|---------|
+| 10 | mb-us1 | US English Female | `mbrola mbrola-us1` |
+| 11 | mb-us2 | US English Male | `mbrola mbrola-us2` |
+| 12 | mb-us3 | US English Male 2 | `mbrola mbrola-us3` |
+| 13 | mb-en1 | British English Male | `mbrola mbrola-en1` |
+
+MBROLA voices use diphone synthesis and generally sound more natural than the default espeak-ng formant voices. To install on Debian/Ubuntu:
+
+```bash
+sudo apt install mbrola mbrola-us1 mbrola-us2
+```
+
+Then set your preferred voice in `~/.tdsr.cfg`:
+
+```ini
+[speech]
+voice_idx = 10    # MBROLA US English Female
 ```
 
 **Quick speech test:**
@@ -245,9 +288,10 @@ Press `Alt+d` to run!
 - **PTY Management** - `portable-pty` for cross-platform PTY
 - **Screen Buffer** - 2D buffer for review cursor navigation
 - **Speech System** - Native TTS backends:
-  - Linux: Speech Dispatcher via `tts` crate
-  - WSL: Windows SAPI via PowerShell interop
+  - Linux: Speech Dispatcher via `tts` crate, or PulseAudio + espeak-ng
+  - WSL: PulseAudio + espeak-ng (WSLG), Windows SAPI fallback, Speech Dispatcher fallback
   - macOS: AVFoundation via `tts` crate
+  - Optional: MBROLA voices for higher quality speech (Linux/WSL)
 - **Input Handling** - Modal key handler stack
 - **Plugin System** - JSON subprocess protocol
 

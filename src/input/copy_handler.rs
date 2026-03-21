@@ -59,12 +59,14 @@ impl CopyHandler {
             b"s" => {
                 debug!("Copy mode: copy screen");
                 let mut text = String::new();
+                let rows = emulator.screen().size.1;
 
-                // Collect all lines from screen
-                for y in 0..emulator.screen().size.1 {
+                // Collect all lines from screen, preserving blank lines
+                // to maintain the visual structure of the content
+                for y in 0..rows {
                     let line = emulator.screen().get_line_trimmed(y);
-                    if !line.is_empty() {
-                        text.push_str(&line);
+                    text.push_str(&line);
+                    if y < rows - 1 {
                         text.push('\n');
                     }
                 }

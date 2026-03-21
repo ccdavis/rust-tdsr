@@ -228,13 +228,15 @@ impl Screen {
 
     /// Insert n blank lines at cursor position
     /// Lines below cursor shift down, bottom lines are lost
+    /// Only operates when cursor is within the scroll region
     pub fn insert_lines(&mut self, n: u16) {
         let y = self.cursor.1 as usize;
-        let (_, bottom) = self.scroll_region.unwrap_or((0, self.size.1 - 1));
+        let (top, bottom) = self.scroll_region.unwrap_or((0, self.size.1 - 1));
+        let top = top as usize;
         let bottom = bottom as usize;
         let cols = self.size.0 as usize;
 
-        if y > bottom {
+        if y < top || y > bottom {
             return;
         }
 
@@ -254,13 +256,15 @@ impl Screen {
 
     /// Delete n lines at cursor position
     /// Lines below shift up, blank lines appear at bottom
+    /// Only operates when cursor is within the scroll region
     pub fn delete_lines(&mut self, n: u16) {
         let y = self.cursor.1 as usize;
-        let (_, bottom) = self.scroll_region.unwrap_or((0, self.size.1 - 1));
+        let (top, bottom) = self.scroll_region.unwrap_or((0, self.size.1 - 1));
+        let top = top as usize;
         let bottom = bottom as usize;
         let cols = self.size.0 as usize;
 
-        if y > bottom {
+        if y < top || y > bottom {
             return;
         }
 
@@ -697,5 +701,49 @@ mod tests {
         assert_eq!(screen.get_char(0, 2), Some('D')); // Was row 3
         assert_eq!(screen.get_line_trimmed(3), ""); // New blank line at bottom of region
         assert_eq!(screen.get_char(0, 4), Some('E')); // Outside region, unchanged
+    }
+
+    #[test]
+    fn test_insert_lines_above_top_margin_is_noop() {
+        let mut screen = Screen::new(10, 5);
+
+        // Fill rows with letters
+        for y in 0..5 {
+            screen.buffer[y][0].data = (b'A' + y as u8) as char;
+        }
+
+        // Set scroll region to rows 2-4 (0-indexed)
+        screen.scroll_region = Some((2, 4));
+
+        // Cursor above top margin (row 0)
+        screen.cursor = (0, 0);
+        screen.insert_lines(1);
+
+        // Nothing should change
+        for y in 0..5 {
+            assert_eq!(screen.get_char(0, y as u16), Some((b'A' + y as u8) as char));
+        }
+    }
+
+    #[test]
+    fn test_delete_lines_above_top_margin_is_noop() {
+        let mut screen = Screen::new(10, 5);
+
+        // Fill rows with letters
+        for y in 0..5 {
+            screen.buffer[y][0].data = (b'A' + y as u8) as char;
+        }
+
+        // Set scroll region to rows 2-4 (0-indexed)
+        screen.scroll_region = Some((2, 4));
+
+        // Cursor above top margin (row 1)
+        screen.cursor = (0, 1);
+        screen.delete_lines(1);
+
+        // Nothing should change
+        for y in 0..5 {
+            assert_eq!(screen.get_char(0, y as u16), Some((b'A' + y as u8) as char));
+        }
     }
 }

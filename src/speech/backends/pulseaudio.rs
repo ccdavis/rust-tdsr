@@ -4,6 +4,11 @@
 //! is available through /mnt/wslg/PulseServer. It uses espeak-ng for
 //! text-to-speech synthesis.
 //!
+//! Uses a persistent espeak-ng process with --stdin to avoid the overhead
+//! and audio artifacts of spawning a new process for every utterance.
+//! Speech is queued by writing lines to stdin; cancel() kills the process
+//! and a new one is started on the next speak() call.
+//!
 //! Dependencies:
 //! - espeak-ng (install with: sudo apt install espeak-ng)
 //! - PulseAudio client libraries (usually pre-installed with WSLG)
@@ -11,13 +16,17 @@
 use crate::platform::is_wsl;
 use crate::speech::{SpeechCommand, Synth};
 use crate::{Result, TdsrError};
-use log::{debug, error, info, warn};
-use std::process::{Child, Command, Stdio};
+use log::{debug, info, warn};
+use std::io::Write;
+use std::process::{Child, ChildStdin, Command, Stdio};
 
-/// PulseAudio backend using espeak-ng
+/// PulseAudio backend using a persistent espeak-ng process
 pub struct PulseAudioSynth {
-    /// Currently running espeak-ng process
-    current_process: Option<Child>,
+    /// Persistent espeak-ng process (reads from stdin via --stdin flag)
+    process: Option<Child>,
+
+    /// Stdin pipe to the persistent process
+    stdin: Option<ChildStdin>,
 
     /// Cached rate setting (0-100)
     rate: u8,
@@ -87,7 +96,8 @@ impl PulseAudioSynth {
         debug!("Found espeak-ng at: {}", espeak_path);
 
         Ok(Self {
-            current_process: None,
+            process: None,
+            stdin: None,
             rate: 50,                // Default rate
             volume: 80,              // Default volume
             voice: "en".to_string(), // Default English voice
@@ -125,90 +135,156 @@ impl PulseAudioSynth {
         80 + ((tdsr_rate as u16) * 370 / 100)
     }
 
-    /// Convert TDSR volume (0-100) to espeak amplitude (0-200)
+    /// Convert TDSR volume (0-100) to espeak amplitude (0-100)
     fn volume_to_espeak_amplitude(tdsr_volume: u8) -> u8 {
-        // Scale 0-100 to 0-200
-        ((tdsr_volume as u16 * 200) / 100) as u8
+        // Direct mapping: TDSR 0-100 → espeak 0-100
+        // espeak-ng's default amplitude is 100; values above 100 cause
+        // clipping and distortion (scratchy/static audio)
+        tdsr_volume
     }
 
     /// Get voice name by index
+    ///
+    /// Indices 0-9: espeak-ng built-in voices (always available)
+    /// Indices 10+: MBROLA voices (require mbrola + voice data packages)
     fn get_voice_by_idx(idx: usize) -> &'static str {
         const VOICES: &[&str] = &[
-            "en",    // 0: Default English
-            "en-us", // 1: US English
-            "en-gb", // 2: British English
-            "en-sc", // 3: Scottish English
-            "es",    // 4: Spanish
-            "fr",    // 5: French
-            "de",    // 6: German
-            "it",    // 7: Italian
-            "pt",    // 8: Portuguese
-            "ru",    // 9: Russian
+            "en",     // 0: Default English
+            "en-us",  // 1: US English
+            "en-gb",  // 2: British English
+            "en-sc",  // 3: Scottish English
+            "es",     // 4: Spanish
+            "fr",     // 5: French
+            "de",     // 6: German
+            "it",     // 7: Italian
+            "pt",     // 8: Portuguese
+            "ru",     // 9: Russian
+            "mb-us1", // 10: MBROLA US English Female (apt: mbrola mbrola-us1)
+            "mb-us2", // 11: MBROLA US English Male (apt: mbrola mbrola-us2)
+            "mb-us3", // 12: MBROLA US English Male 2 (apt: mbrola mbrola-us3)
+            "mb-en1", // 13: MBROLA British English Male (apt: mbrola mbrola-en1)
         ];
 
         VOICES.get(idx).unwrap_or(&"en")
     }
 
-    /// Cancel any currently running speech process
-    fn cancel_process(&mut self) {
-        if let Some(mut child) = self.current_process.take() {
-            debug!("Killing espeak-ng process");
-            match child.kill() {
-                Ok(_) => {
-                    let _ = child.wait(); // Clean up zombie
-                }
-                Err(e) => {
-                    debug!("Failed to kill espeak-ng process: {}", e);
-                }
-            }
+    /// Start a persistent espeak-ng process with --stdin
+    ///
+    /// The process reads text from stdin line-by-line and speaks each line.
+    /// This avoids the overhead and audio artifacts of spawning a new process
+    /// for every utterance, and allows speech to be properly queued.
+    fn start_process(&mut self) -> Result<()> {
+        self.stop_process();
+
+        let speed = Self::rate_to_espeak_speed(self.rate);
+        let amplitude = Self::volume_to_espeak_amplitude(self.volume);
+
+        // Don't pass --stdin: it waits for EOF before speaking.
+        // Without --stdin or a text argument, espeak-ng reads from stdin
+        // line by line, speaking each line as it arrives.
+        let mut cmd = Command::new(&self.espeak_path);
+        cmd.arg("-v")
+            .arg(&self.voice)
+            .arg("-s")
+            .arg(speed.to_string())
+            .arg("-a")
+            .arg(amplitude.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        // Increase PulseAudio buffer to reduce crackling/static artifacts,
+        // especially on WSLG where the audio transport adds latency
+        cmd.env("PULSE_LATENCY_MSEC", "60");
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| TdsrError::Speech(format!("Failed to start espeak-ng: {}", e)))?;
+
+        self.stdin = child.stdin.take();
+        self.process = Some(child);
+        debug!("Started persistent espeak-ng process");
+        Ok(())
+    }
+
+    /// Stop the persistent espeak-ng process
+    fn stop_process(&mut self) {
+        // Drop stdin first to close the pipe
+        self.stdin = None;
+
+        if let Some(mut child) = self.process.take() {
+            debug!("Stopping espeak-ng process");
+            let _ = child.kill();
+            let _ = child.wait(); // Clean up zombie
         }
     }
 
-    /// Speak text using espeak-ng
+    /// Ensure the persistent process is running, restarting if needed
+    fn ensure_process(&mut self) -> Result<()> {
+        let needs_restart = match &mut self.process {
+            Some(child) => match child.try_wait() {
+                Ok(Some(_)) => {
+                    // Process exited
+                    self.process = None;
+                    self.stdin = None;
+                    true
+                }
+                Ok(None) => self.stdin.is_none(), // Running but no stdin pipe
+                Err(_) => {
+                    self.process = None;
+                    self.stdin = None;
+                    true
+                }
+            },
+            None => true,
+        };
+
+        if needs_restart {
+            self.start_process()?;
+        }
+        Ok(())
+    }
+
+    /// Speak text by writing to the persistent espeak-ng process stdin
+    ///
+    /// Unlike the old approach of spawning a new process per utterance,
+    /// this writes text as a line to the persistent process. espeak-ng
+    /// queues and speaks each line in order. This means multiple rapid
+    /// speak() calls (e.g., multi-line command output) are all heard.
     fn speak_internal(&mut self, text: &str, is_letter: bool) -> Result<()> {
         if text.is_empty() {
             return Ok(());
         }
 
-        // Cancel any current speech
-        self.cancel_process();
+        self.ensure_process()?;
 
-        let speed = Self::rate_to_espeak_speed(self.rate);
-        let amplitude = Self::volume_to_espeak_amplitude(self.volume);
-
-        let mut cmd = Command::new(&self.espeak_path);
-        cmd.arg("-v").arg(&self.voice);
-        cmd.arg("-s").arg(speed.to_string());
-        cmd.arg("-a").arg(amplitude.to_string());
-
-        // For letters, add spacing
         let text_to_speak = if is_letter {
             format!(" {} ", text)
         } else {
             text.to_string()
         };
 
-        cmd.arg(text_to_speak);
-
-        // PULSE_SERVER is already set in new() and will be inherited by subprocess
-        // Spawn espeak-ng process
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::null());
-
-        match cmd.spawn() {
-            Ok(child) => {
-                self.current_process = Some(child);
-                debug!("espeak-ng process started");
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to spawn espeak-ng: {}", e);
-                Err(TdsrError::Speech(format!(
-                    "Failed to start espeak-ng: {}",
-                    e
-                )))
+        // Try to write to the process; if the pipe is broken, restart and retry
+        if let Some(ref mut stdin) = self.stdin {
+            if let Err(e) = writeln!(stdin, "{}", text_to_speak) {
+                warn!("espeak-ng pipe broken (restarting): {}", e);
+                self.start_process()?;
+                if let Some(ref mut stdin) = self.stdin {
+                    writeln!(stdin, "{}", text_to_speak).map_err(|e| {
+                        TdsrError::Speech(format!("Failed to write to espeak-ng: {}", e))
+                    })?;
+                    stdin.flush().map_err(|e| {
+                        TdsrError::Speech(format!("Failed to flush espeak-ng stdin: {}", e))
+                    })?;
+                }
+            } else {
+                stdin.flush().map_err(|e| {
+                    TdsrError::Speech(format!("Failed to flush espeak-ng stdin: {}", e))
+                })?;
             }
         }
+
+        Ok(())
     }
 }
 
@@ -227,12 +303,20 @@ impl Synth for PulseAudioSynth {
     fn set_rate(&mut self, rate: u8) -> Result<()> {
         debug!("Setting rate to {}", rate);
         self.rate = rate;
+        // Restart process to apply new rate
+        if self.process.is_some() {
+            self.start_process()?;
+        }
         Ok(())
     }
 
     fn set_volume(&mut self, volume: u8) -> Result<()> {
         debug!("Setting volume to {}", volume);
         self.volume = volume;
+        // Restart process to apply new volume
+        if self.process.is_some() {
+            self.start_process()?;
+        }
         Ok(())
     }
 
@@ -240,6 +324,10 @@ impl Synth for PulseAudioSynth {
         let voice = Self::get_voice_by_idx(idx);
         debug!("Setting voice to {} (index {})", voice, idx);
         self.voice = voice.to_string();
+        // Restart process to apply new voice
+        if self.process.is_some() {
+            self.start_process()?;
+        }
         Ok(())
     }
 
@@ -255,7 +343,7 @@ impl Synth for PulseAudioSynth {
 
     fn cancel(&mut self) -> Result<()> {
         debug!("Canceling speech");
-        self.cancel_process();
+        self.stop_process();
         Ok(())
     }
 }
@@ -263,7 +351,7 @@ impl Synth for PulseAudioSynth {
 impl Drop for PulseAudioSynth {
     fn drop(&mut self) {
         debug!("Shutting down PulseAudio backend");
-        self.cancel_process();
+        self.stop_process();
     }
 }
 
@@ -281,8 +369,8 @@ mod tests {
     #[test]
     fn test_volume_conversion() {
         assert_eq!(PulseAudioSynth::volume_to_espeak_amplitude(0), 0);
-        assert_eq!(PulseAudioSynth::volume_to_espeak_amplitude(50), 100);
-        assert_eq!(PulseAudioSynth::volume_to_espeak_amplitude(100), 200);
+        assert_eq!(PulseAudioSynth::volume_to_espeak_amplitude(50), 50);
+        assert_eq!(PulseAudioSynth::volume_to_espeak_amplitude(100), 100);
     }
 
     #[test]

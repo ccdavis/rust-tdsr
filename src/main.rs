@@ -177,15 +177,12 @@ fn run() -> Result<()> {
     // Speak welcome message
     state.speak("TDSR, presented by Lighthouse of San Francisco")?;
 
-    println!("TDSR {} ready - All phases complete!", tdsr::VERSION);
-    println!("Configuration loaded: {}", state.config.path().display());
-    println!("  Process symbols: {}", state.config.process_symbols());
-    println!("  Key echo: {}", state.config.key_echo());
-    println!("  Cursor tracking: {}", state.config.cursor_tracking());
-    println!("  Symbols loaded: {}", state.config.symbols.len());
-    println!("Speech synthesizer initialized");
-    println!("PTY running, screen buffer active");
-    println!("Type 'exit' to quit");
+    info!("TDSR {} ready", tdsr::VERSION);
+    info!("Configuration loaded: {}", state.config.path().display());
+    info!("  Process symbols: {}", state.config.process_symbols());
+    info!("  Key echo: {}", state.config.key_echo());
+    info!("  Cursor tracking: {}", state.config.cursor_tracking());
+    info!("  Symbols loaded: {}", state.config.symbols.len());
 
     // Main event loop
     // Screen reader continuously monitors for:
@@ -374,6 +371,19 @@ fn handle_stdin(
                 let ch = input[0] as char;
                 if ch.is_ascii_graphic() || ch == ' ' {
                     state.last_key = Some(ch);
+                    // Accumulate typed characters to track the current command
+                    state.input_line.push(ch);
+                } else if ch == '\r' || ch == '\n' {
+                    // Enter pressed - save accumulated input as last_command
+                    if !state.input_line.is_empty() {
+                        state.last_command = std::mem::take(&mut state.input_line);
+                    }
+                } else if ch == '\x08' || ch == '\x7f' {
+                    // Backspace - remove last character from input line
+                    state.input_line.pop();
+                } else if ch == '\x03' || ch == '\x15' {
+                    // Ctrl+C or Ctrl+U - clear input line
+                    state.input_line.clear();
                 }
             } else {
                 // Multi-byte input (escape sequence, etc.) - clear last key
@@ -427,19 +437,21 @@ fn handle_pty_output(pty: &mut Pty, emulator: &mut Emulator, state: &mut State) 
             line_pause,
         )?;
 
-        // Key echo: if output is just the last typed character being echoed,
-        // speak it as a character (phonetically) instead of normal speech
-        if key_echo {
-            if let Some(typed_key) = last_key {
-                // Check if output is just the single character we typed
-                // (terminals typically echo the character immediately)
-                if output.len() == 1 && output[0] as char == typed_key {
-                    // Speak the character and skip normal speech buffer
+        // Key echo handling: detect when the terminal echoes back the character
+        // we just typed and handle it according to key_echo setting
+        if let Some(typed_key) = last_key {
+            // Check if output is just the single character we typed
+            // (terminals typically echo the character immediately)
+            if output.len() == 1 && output[0] as char == typed_key {
+                if key_echo {
+                    // Speak the character phonetically
                     state.speak_char(typed_key)?;
-                    state.speech_buffer.flush(); // Discard the character from buffer
-                    state.last_key = None;
-                    return Ok(());
                 }
+                // Either way, discard the echoed character from speech buffer
+                // so it's not spoken again through the normal path
+                state.speech_buffer.flush();
+                state.last_key = None;
+                return Ok(());
             }
         }
 

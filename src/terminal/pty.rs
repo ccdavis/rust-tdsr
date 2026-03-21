@@ -6,6 +6,7 @@
 
 use crate::{Result, TdsrError};
 use log::{debug, info};
+use nix::libc;
 use nix::unistd::dup;
 use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
 use std::io::{Read, Write};
@@ -140,9 +141,11 @@ impl Pty {
 
     /// Write input to the PTY
     ///
-    /// Passes user keystrokes through to the shell
-    pub fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        self.writer.write(buf).map_err(TdsrError::Io)
+    /// Passes user keystrokes through to the shell.
+    /// Uses write_all to ensure all bytes are written (no silent truncation
+    /// on partial writes, which can happen with large paste operations).
+    pub fn write(&mut self, buf: &[u8]) -> Result<()> {
+        self.writer.write_all(buf).map_err(TdsrError::Io)
     }
 
     /// Flush writer
@@ -153,15 +156,33 @@ impl Pty {
     /// Resize the terminal
     ///
     /// Called when user resizes their terminal window (SIGWINCH).
-    /// Screen reader needs to resize both PTY and internal screen buffer.
-    /// Note: portable-pty doesn't support runtime resize, so this is a no-op for now
+    /// Uses TIOCSWINSZ ioctl to inform the child shell of the new dimensions.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
-        debug!(
-            "PTY resize requested to {}x{} (not supported by portable-pty)",
-            rows, cols
-        );
-        // TODO: portable-pty doesn't support resizing after creation
-        // May need to use nix directly for this
+        debug!("PTY resize to {}x{}", rows, cols);
+
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+
+        let result = unsafe { libc::ioctl(self.fd, libc::TIOCSWINSZ, &ws) };
+
+        if result == -1 {
+            let err = std::io::Error::last_os_error();
+            debug!("PTY resize ioctl failed: {}", err);
+            return Err(TdsrError::Pty(format!("Failed to resize PTY: {}", err)));
+        }
+
+        self._size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+
+        debug!("PTY resized successfully to {}x{}", rows, cols);
         Ok(())
     }
 }

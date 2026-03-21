@@ -74,6 +74,10 @@ pub struct State {
     /// Some plugins only trigger after specific commands
     pub last_command: String,
 
+    /// Input line accumulator for tracking what the user types
+    /// When Enter is pressed, this becomes last_command
+    pub input_line: String,
+
     /// Last key typed by user (for key echo)
     /// When terminal echoes this character back and key_echo is enabled,
     /// we speak the character
@@ -165,6 +169,7 @@ impl State {
             copy_start: None,
             delaying_output: false,
             last_command: String::new(),
+            input_line: String::new(),
             last_key: None,
             plugin_manager,
             delayed_functions: Vec::new(),

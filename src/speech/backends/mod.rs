@@ -8,3 +8,7 @@ pub mod windows;
 
 // PulseAudio backend using espeak-ng for WSL/WSLG
 pub mod pulseaudio;
+
+// macOS AVFoundation backend with a dedicated CFRunLoop thread
+#[cfg(target_os = "macos")]
+pub mod avfoundation;

@@ -59,7 +59,12 @@ tts = "0.26"
 # Speech Dispatcher for Linux TTS (now using native bindings via tts crate)
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# macOS speech synthesis (now using AVFoundation via tts crate)
+# Dedicated AVFoundation speech backend (see speech/backends/avfoundation.rs):
+# AVSpeechSynthesizer needs a serviced CFRunLoop, so we drive it directly on a
+# dedicated thread instead of through the tts crate on the main thread.
+objc = "0.2"
+core-foundation = "0.9"
+core-foundation-sys = "0.8"
 
 [dev-dependencies]
 tempfile = "3.12"

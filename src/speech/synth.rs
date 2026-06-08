@@ -6,6 +6,8 @@
 use crate::platform::is_wsl;
 use crate::Result;
 use log::info;
+#[cfg(target_os = "macos")]
+use log::warn;
 
 /// Commands sent to speech backend
 ///
@@ -167,7 +169,30 @@ pub fn create_synth() -> Result<Box<dyn Synth>> {
         }
     }
 
-    // macOS and other platforms
+    // macOS: dedicated AVFoundation backend with its own CFRunLoop.
+    // AVSpeechSynthesizer only advances its utterance queue while a run loop is
+    // serviced; running it on a dedicated thread keeps speech working and
+    // decoupled from the mio I/O loop. Falls back to the tts crate on failure.
+    #[cfg(target_os = "macos")]
+    {
+        info!("Trying AVFoundation speech-server backend...");
+        use super::backends::avfoundation::AvServerSynth;
+
+        match AvServerSynth::new() {
+            Ok(synth) => {
+                info!("✓ Successfully initialized AVFoundation speech-server backend");
+                return Ok(Box::new(synth));
+            }
+            Err(e) => {
+                warn!(
+                    "✗ AVFoundation backend unavailable: {}; falling back to tts crate",
+                    e
+                );
+            }
+        }
+    }
+
+    // Other platforms (and macOS fallback): native tts crate
     info!(
         "Creating native speech synthesizer for platform: {}",
         platform

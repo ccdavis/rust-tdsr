@@ -90,6 +90,20 @@ TDSR will speak "TDSR, presented by Lighthouse of San Francisco" when ready.
 
 **Note:** By default, TDSR runs quietly without log output. Use `--debug` or `-d` to enable detailed logging to `tdsr.log`.
 
+## Terminal setup
+
+TDSR's review and command keys are triggered with **Alt** (the Meta key) — e.g. `Alt+u`/`Alt+i`/`Alt+o` to read the previous/current/next line. A terminal screen reader only sees the raw byte stream from your terminal; there is no "Alt" byte. By convention, Alt/Meta+key is sent as an **Escape prefix** (`ESC` followed by the key), and that is exactly what TDSR's key bindings match.
+
+Most terminals do **not** send Escape for the Option/Alt key by default — on macOS, Option produces accented characters (Option+u = ¨) or triggers system shortcuts instead. You must tell your terminal to treat Option/Alt as Meta:
+
+- **macOS Terminal.app:** Settings → Profiles → **Keyboard** → check **"Use Option as Meta key."**
+- **macOS iTerm2:** Settings → Profiles → **Keys** → set **Left Option key** (and Right, if you like) to **Esc+**.
+- **Linux / GNOME Terminal, Konsole, etc.:** Alt is normally already sent as Meta; no change needed. If your terminal has an "Alt sends Escape" / "Meta sends Escape" option, ensure it is enabled.
+
+If the navigation keys print accented characters or open other apps instead of speaking, this setting is the cause.
+
+(The original Python TDSR required the same setting — this is inherent to how terminal key input works, not specific to this port.)
+
 ## Configuration
 
 Configuration file: `~/.tdsr.cfg` (INI format)
@@ -115,6 +129,29 @@ repeated_symbols = false
 repeated_symbols_values = -=!#
 prompt = .*         # Regex for prompt (plugin system)
 ```
+
+### Voice Selection (macOS)
+
+By default macOS TDSR uses **Eloquence** (the **Reed** variant) if it is installed — the responsive synthesizer many screen-reader users prefer — and otherwise **follows your VoiceOver voice** (including premium "Siri" voices). Eloquence is a free download in **System Settings → Accessibility → Spoken Content → System Voice → Manage Voices** (search for "Eloquence"). It is matched to your current language when possible.
+
+To use a *specific* voice instead, list the installed voices and their indices:
+
+```bash
+tdsr --list-voices
+```
+
+This prints every voice available to TDSR with its index, name, language, and quality (`default` / `enhanced` / `premium`); Eloquence voices are flagged with `<- eloquence`. `enhanced`/`premium` voices sound far better than the default ones.
+
+Then set the index in `~/.tdsr.cfg` (or via the config menu, Alt+c → V):
+
+```ini
+[speech]
+voice_idx = 144     # an index from `tdsr --list-voices`
+```
+
+To return to the default (Eloquence if installed, else VoiceOver), remove `voice_idx` or set it to `-1`.
+
+**Note:** `--list-voices` shows the voices Apple exposes to apps. VoiceOver's own Siri voices are *not* in that list — the only way to use them is the default (VoiceOver-follow) setting, i.e. no `voice_idx` and no Eloquence installed.
 
 ### Voice Selection (Linux / WSL with espeak-ng backend)
 

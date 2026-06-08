@@ -35,6 +35,28 @@ extern "C" fn handle_sigwinch(_: libc::c_int) {
 fn main() {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
+
+    // macOS speech-server mode: AVSpeechSynthesizer needs a serviced run loop
+    // on the process main thread, so we re-exec ourselves as a child that does
+    // exactly that. This must run before any terminal/PTY setup and never
+    // returns (it owns this process's main thread).
+    #[cfg(target_os = "macos")]
+    if args
+        .iter()
+        .any(|arg| arg == tdsr::speech::backends::avfoundation::SPEECH_SERVER_FLAG)
+    {
+        tdsr::speech::backends::avfoundation::run_speech_server();
+    }
+
+    // List installed macOS voices and exit (for choosing `voice_idx`).
+    #[cfg(target_os = "macos")]
+    if args
+        .iter()
+        .any(|arg| arg == tdsr::speech::backends::avfoundation::LIST_VOICES_FLAG)
+    {
+        tdsr::speech::backends::avfoundation::list_voices();
+    }
+
     let debug_mode = args.iter().any(|arg| arg == "--debug" || arg == "-d");
 
     // Initialize logger
@@ -110,7 +132,9 @@ fn run() -> Result<()> {
     // Parse command line arguments (filter out --debug flag)
     let args: Vec<String> = std::env::args()
         .skip(1)
-        .filter(|arg| arg != "--debug" && arg != "-d")
+        .filter(|arg| {
+            arg != "--debug" && arg != "-d" && arg != "--speech-server" && arg != "--list-voices"
+        })
         .collect();
     let program = if args.is_empty() { None } else { Some(args) };
 

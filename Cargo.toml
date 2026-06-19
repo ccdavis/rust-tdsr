@@ -14,6 +14,14 @@ categories = ["accessibility", "command-line-utilities"]
 name = "tdsr"
 path = "src/main.rs"
 
+[features]
+# The `native-speech` feature pulls in the `tts` crate (Speech Dispatcher on
+# Linux). It is on by default. Build with `--no-default-features` to omit it,
+# e.g. on distros whose speech-dispatcher is too old to compile (Ubuntu 20.04);
+# such builds use the PulseAudio + espeak-ng backend on Linux.
+default = ["native-speech"]
+native-speech = ["dep:tts"]
+
 [dependencies]
 # Terminal emulation
 vte = "0.13"
@@ -51,8 +59,11 @@ once_cell = "1.19"
 # Directory utilities
 dirs = "5.0"
 
-# Text-to-speech
-tts = "0.26"
+# Text-to-speech via the `tts` crate (Speech Dispatcher on Linux, AVFoundation
+# fallback on macOS). Optional: enabling it requires libspeechd-dev >= 0.10 at
+# build time. Disable with --no-default-features on older distros (e.g. Ubuntu
+# 20.04, which ships speech-dispatcher 0.9.1) to build an espeak-ng-only binary.
+tts = { version = "0.26", optional = true }
 
 # Platform-specific dependencies
 [target.'cfg(target_os = "linux")'.dependencies]

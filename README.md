@@ -55,12 +55,27 @@ Also, it's nice to have a single binary to deploy wherever you need a talking te
 
 ### Building from Source
 
+On Linux/WSL you can install all build and runtime prerequisites with the
+helper script (supports apt / dnf / pacman / zypper; no-op extras on macOS):
+
+```bash
+./install-deps.sh        # add --with-mbrola for higher-quality voices
+```
+
+Then build:
+
 ```bash
 cd rust
 cargo build --release
 ```
 
 The binary will be at `target/release/tdsr`.
+
+> **Older distributions (e.g. Ubuntu 20.04):** the default build needs
+> speech-dispatcher >= 0.10. Where it's older, build the espeak-ng-only variant
+> with `cargo build --release --no-default-features` (or `./build.sh
+> --espeak-only`) — this uses the low-latency PulseAudio + espeak-ng backend and
+> needs no libclang/libspeechd. See [INSTALL.md](INSTALL.md) for details.
 
 ### Installation
 

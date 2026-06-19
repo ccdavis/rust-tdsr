@@ -1,6 +1,8 @@
 //! Platform-specific speech backends
 
-// Native TTS backend using the tts crate (cross-platform)
+// Native TTS backend using the tts crate (cross-platform).
+// Optional: only compiled when the `native-speech` feature is enabled.
+#[cfg(feature = "native-speech")]
 pub mod native;
 
 // Windows SAPI backend for WSL

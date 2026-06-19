@@ -2,6 +2,21 @@
 
 All notable changes to the Rust implementation of TDSR.
 
+## [Unreleased]
+
+### Added
+- `install-deps.sh` — installs build and runtime prerequisites for macOS, WSL,
+  and Linux (apt / dnf / pacman / zypper), with `--with-mbrola` and `--dry-run`.
+- `native-speech` Cargo feature (on by default) gating the `tts`/Speech
+  Dispatcher backend. Build with `--no-default-features` (or `./build.sh
+  --espeak-only`) to produce an espeak-ng-only binary that needs no
+  libclang/libspeechd — enabling builds on distros whose speech-dispatcher is
+  too old for the `speech-dispatcher` crate (>= 0.10 required), e.g. Ubuntu 20.04.
+
+### Changed
+- `build.sh` now auto-detects an old or missing speech-dispatcher and builds the
+  espeak-ng-only variant automatically, instead of failing the dependency check.
+
 ## [0.1.0] - 2025
 
 ### Complete Rust Implementation

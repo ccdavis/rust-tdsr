@@ -107,44 +107,52 @@ pub fn create_synth() -> Result<Box<dyn Synth>> {
             }
         }
 
-        // Fall back to Speech Dispatcher
-        info!("Trying Speech Dispatcher backend...");
-        use super::backends::native::NativeSynth;
+        // Fall back to Speech Dispatcher (only when built with `native-speech`)
+        #[cfg(feature = "native-speech")]
+        {
+            info!("Trying Speech Dispatcher backend...");
+            use super::backends::native::NativeSynth;
 
-        match NativeSynth::new() {
-            Ok(synth) => {
-                info!("✓ Successfully initialized Speech Dispatcher backend");
-                return Ok(Box::new(synth));
-            }
-            Err(e) => {
-                return Err(crate::TdsrError::Speech(format!(
-                    "No speech backend available on WSL. Tried:\n\
-                     1. PulseAudio + espeak-ng (install: sudo apt install espeak-ng)\n\
-                     2. Windows SAPI (PowerShell not available)\n\
-                     3. Speech Dispatcher (not configured)\n\
-                     Error: {}",
-                    e
-                )));
+            match NativeSynth::new() {
+                Ok(synth) => {
+                    info!("✓ Successfully initialized Speech Dispatcher backend");
+                    return Ok(Box::new(synth));
+                }
+                Err(e) => {
+                    info!("✗ Speech Dispatcher unavailable: {}", e);
+                }
             }
         }
+
+        return Err(crate::TdsrError::Speech(
+            "No speech backend available on WSL. Tried:\n\
+             1. PulseAudio + espeak-ng (install: sudo apt install espeak-ng)\n\
+             2. Windows SAPI (PowerShell not available)\n\
+             3. Speech Dispatcher (not configured, or built without 'native-speech')"
+                .to_string(),
+        ));
     }
 
     // Native Linux: Try Speech Dispatcher first, then PulseAudio
     if platform == "linux" {
         info!("Detected native Linux environment");
 
-        // Try Speech Dispatcher first (standard Linux TTS)
-        info!("Trying Speech Dispatcher backend...");
-        use super::backends::native::NativeSynth;
+        // Try Speech Dispatcher first (standard Linux TTS), if compiled in.
+        // Builds without `native-speech` skip straight to PulseAudio + espeak-ng.
+        #[cfg(feature = "native-speech")]
+        {
+            info!("Trying Speech Dispatcher backend...");
+            use super::backends::native::NativeSynth;
 
-        match NativeSynth::new() {
-            Ok(synth) => {
-                info!("✓ Successfully initialized Speech Dispatcher backend");
-                return Ok(Box::new(synth));
-            }
-            Err(e) => {
-                info!("✗ Speech Dispatcher unavailable: {}", e);
-                info!("To install: sudo apt install speech-dispatcher");
+            match NativeSynth::new() {
+                Ok(synth) => {
+                    info!("✓ Successfully initialized Speech Dispatcher backend");
+                    return Ok(Box::new(synth));
+                }
+                Err(e) => {
+                    info!("✗ Speech Dispatcher unavailable: {}", e);
+                    info!("To install: sudo apt install speech-dispatcher");
+                }
             }
         }
 
@@ -192,21 +200,34 @@ pub fn create_synth() -> Result<Box<dyn Synth>> {
         }
     }
 
-    // Other platforms (and macOS fallback): native tts crate
-    info!(
-        "Creating native speech synthesizer for platform: {}",
-        platform
-    );
-    use super::backends::native::NativeSynth;
+    // Other platforms (and macOS fallback): native tts crate, if compiled in.
+    #[cfg(feature = "native-speech")]
+    {
+        info!(
+            "Creating native speech synthesizer for platform: {}",
+            platform
+        );
+        use super::backends::native::NativeSynth;
 
-    match NativeSynth::new() {
-        Ok(synth) => {
-            info!("✓ Successfully initialized native TTS backend");
-            Ok(Box::new(synth))
+        match NativeSynth::new() {
+            Ok(synth) => {
+                info!("✓ Successfully initialized native TTS backend");
+                Ok(Box::new(synth))
+            }
+            Err(e) => Err(crate::TdsrError::Speech(format!(
+                "Failed to initialize speech backend for platform '{}': {}",
+                platform, e
+            ))),
         }
-        Err(e) => Err(crate::TdsrError::Speech(format!(
-            "Failed to initialize speech backend for platform '{}': {}",
-            platform, e
-        ))),
+    }
+
+    #[cfg(not(feature = "native-speech"))]
+    {
+        Err(crate::TdsrError::Speech(format!(
+            "No speech backend available for platform '{}'. This binary was built \
+             without the 'native-speech' feature, so the Speech Dispatcher / tts \
+             backend is not included.",
+            platform
+        )))
     }
 }

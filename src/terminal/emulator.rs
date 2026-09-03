@@ -39,28 +39,35 @@ impl Emulator {
     ///
     /// If `line_pause` is true, the speech buffer will be segmented at line
     /// breaks so each line can be spoken with a pause between them.
+    ///
+    /// `echo_key` is the character the user just typed (if any); when the
+    /// first character drawn matches it, that character is kept out of the
+    /// speech buffer and returned so the caller can key-echo it.
     pub fn process_with_speech(
         &mut self,
         bytes: &[u8],
         speech_buffer: &mut SpeechBuffer,
         last_drawn: &mut (u16, u16),
         line_pause: bool,
-    ) -> Result<()> {
+        echo_key: &mut Option<char>,
+    ) -> Result<Option<char>> {
         trace!("Processing {} bytes from PTY", bytes.len());
 
         // Advance the parser byte by byte
         // The performer adds characters to speech buffer as they're drawn
+        let mut performer = ScreenPerformer {
+            screen: &mut self.screen,
+            speech_buffer,
+            last_drawn,
+            line_pause,
+            echo_key,
+            echoed: None,
+        };
         for &byte in bytes {
-            let mut performer = ScreenPerformer {
-                screen: &mut self.screen,
-                speech_buffer,
-                last_drawn,
-                line_pause,
-            };
             self.parser.advance(&mut performer, byte);
         }
 
-        Ok(())
+        Ok(performer.echoed)
     }
 
     /// Process bytes from PTY (without speech)
@@ -69,7 +76,8 @@ impl Emulator {
     pub fn process(&mut self, bytes: &[u8]) -> Result<()> {
         let mut dummy_buffer = SpeechBuffer::new();
         let mut dummy_pos = (0, 0);
-        self.process_with_speech(bytes, &mut dummy_buffer, &mut dummy_pos, false)
+        self.process_with_speech(bytes, &mut dummy_buffer, &mut dummy_pos, false, &mut None)
+            .map(|_| ())
     }
 
     /// Resize the emulator

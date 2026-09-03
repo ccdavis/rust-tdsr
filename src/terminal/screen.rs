@@ -6,6 +6,55 @@
 
 use super::Cell;
 
+/// A designatable character set (`ESC ( x` / `ESC ) x`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Charset {
+    /// Plain characters (`B`, and anything we don't translate)
+    Ascii,
+    /// DEC special graphics (`0`): the line-drawing set ncurses, tmux and
+    /// dialog use for box borders under TERM=xterm*
+    DecSpecialGraphics,
+}
+
+/// Map a character through the DEC special graphics set. Only `` ` `` to `~`
+/// are redefined; everything else passes through.
+pub fn dec_special_graphics(c: char) -> char {
+    match c {
+        '`' => '◆',
+        'a' => '▒',
+        'b' => '␉',
+        'c' => '␌',
+        'd' => '␍',
+        'e' => '␊',
+        'f' => '°',
+        'g' => '±',
+        'h' => '␤',
+        'i' => '␋',
+        'j' => '┘',
+        'k' => '┐',
+        'l' => '┌',
+        'm' => '└',
+        'n' => '┼',
+        'o' => '⎺',
+        'p' => '⎻',
+        'q' => '─',
+        'r' => '⎼',
+        's' => '⎽',
+        't' => '├',
+        'u' => '┤',
+        'v' => '┴',
+        'w' => '┬',
+        'x' => '│',
+        'y' => '≤',
+        'z' => '≥',
+        '{' => 'π',
+        '|' => '≠',
+        '}' => '£',
+        '~' => '·',
+        other => other,
+    }
+}
+
 /// Terminal screen buffer that holds the visual state for screen reader access
 ///
 /// This is the primary data structure the screen reader reads from.
@@ -27,13 +76,32 @@ pub struct Screen {
     /// Used when programs like vim or less set custom scroll regions
     pub scroll_region: Option<(u16, u16)>,
 
-    /// Saved cursor position for ESC 7/8 (DECSC/DECRC) sequences
-    /// Full-screen apps (vim, less) save/restore cursor when switching screens
+    /// Main-screen cursor saved when entering the alternate screen (1049)
     pub saved_cursor: Option<(u16, u16)>,
+
+    /// Cursor saved by ESC 7 (DECSC), restored by ESC 8 (DECRC). Kept apart
+    /// from `saved_cursor` because apps use DECSC/DECRC freely while inside
+    /// the alternate screen.
+    pub decsc_cursor: Option<(u16, u16)>,
 
     /// Saved buffer for alternate screen mode
     /// Allows screen reader to restore previous content when apps exit
     saved_buffer: Option<Vec<Vec<Cell>>>,
+
+    /// Whether the alternate screen is active. Re-entering it must not
+    /// overwrite the saved main screen with alternate-screen content.
+    pub in_alt_screen: bool,
+
+    /// Character sets designated to G0 and G1 (`ESC (` / `ESC )`), and
+    /// which one is active (SI selects G0, SO selects G1). Only the DEC
+    /// special graphics set is translated; everything else is ASCII.
+    pub charsets: [Charset; 2],
+    pub active_charset: usize,
+
+    /// Set after printing in the last column: the cursor is shown there but
+    /// the next printed character wraps to the next line first (DECAWM).
+    /// Cleared by any explicit cursor movement or erase.
+    pub pending_wrap: bool,
 
     /// Accumulated scroll count since last check
     /// Positive = scrolled up (content moved up, so review cursor should move up to follow)
@@ -52,9 +120,61 @@ impl Screen {
             size: (cols, rows),
             scroll_region: None,
             saved_cursor: None,
+            decsc_cursor: None,
             saved_buffer: None,
+            in_alt_screen: false,
+            charsets: [Charset::Ascii, Charset::Ascii],
+            active_charset: 0,
+            pending_wrap: false,
             scroll_offset: 0,
         }
+    }
+
+    /// Translate a printable character through the active character set.
+    pub fn map_charset(&self, c: char) -> char {
+        match self.charsets[self.active_charset] {
+            Charset::Ascii => c,
+            Charset::DecSpecialGraphics => dec_special_graphics(c),
+        }
+    }
+
+    /// Move the cursor to an absolute position, clamped to the screen.
+    /// Any explicit positioning cancels a pending auto-wrap.
+    pub fn set_cursor(&mut self, x: u16, y: u16) {
+        self.cursor = (
+            x.min(self.size.0.saturating_sub(1)),
+            y.min(self.size.1.saturating_sub(1)),
+        );
+        self.pending_wrap = false;
+    }
+
+    /// Text of a linear (reading-order) range, inclusive at both ends, as
+    /// used by copy/selection. Rows are joined with newlines, each row's
+    /// trailing spaces are dropped, and wide-character continuation cells
+    /// are skipped. The endpoints may be given in either order.
+    pub fn text_range(&self, start: (u16, u16), end: (u16, u16)) -> String {
+        let (mut start, mut end) = (start, end);
+        if (start.1, start.0) > (end.1, end.0) {
+            std::mem::swap(&mut start, &mut end);
+        }
+        let last_col = self.size.0.saturating_sub(1);
+        let mut text = String::new();
+        for y in start.1..=end.1 {
+            let from = if y == start.1 { start.0 } else { 0 };
+            let to = if y == end.1 { end.0 } else { last_col };
+            let mut row = String::new();
+            for x in from..=to {
+                match self.get_char(x, y) {
+                    Some('\0') | None => {}
+                    Some(ch) => row.push(ch),
+                }
+            }
+            text.push_str(row.trim_end());
+            if y < end.1 {
+                text.push('\n');
+            }
+        }
+        text
     }
 
     /// Get and reset scroll offset
@@ -74,10 +194,15 @@ impl Screen {
             .map(|cell| cell.data)
     }
 
-    /// Get entire line as string for screen reader line reading
+    /// Get entire line as string for screen reader line reading.
+    /// Wide-character continuation cells are skipped so the text carries no
+    /// NUL bytes.
     pub fn get_line(&self, y: u16) -> String {
         if let Some(row) = self.buffer.get(y as usize) {
-            row.iter().map(|cell| cell.data).collect()
+            row.iter()
+                .filter(|cell| !cell.is_wide_continuation)
+                .map(|cell| cell.data)
+                .collect()
         } else {
             String::new()
         }
@@ -92,21 +217,51 @@ impl Screen {
     /// Called when terminal window size changes (SIGWINCH)
     pub fn resize(&mut self, cols: u16, rows: u16) {
         // Preserve existing content as much as possible for screen reader continuity
-        let mut new_buffer = vec![vec![Cell::new(); cols as usize]; rows as usize];
+        self.buffer = Self::resized_buffer(&self.buffer, cols, rows);
 
-        // Copy old content into new buffer
-        let copy_rows = (rows as usize).min(self.buffer.len());
-        for (y, row) in new_buffer.iter_mut().enumerate().take(copy_rows) {
-            let copy_cols = (cols as usize).min(self.buffer[y].len());
-            row[..copy_cols].clone_from_slice(&self.buffer[y][..copy_cols]);
+        // The alternate-screen copy (saved while vim/less is running) must be
+        // resized too: `restore_screen` swaps it back in, and every row-level
+        // operation assumes rows are exactly `size.0` wide.
+        if let Some(saved) = self.saved_buffer.as_ref() {
+            self.saved_buffer = Some(Self::resized_buffer(saved, cols, rows));
         }
 
-        self.buffer = new_buffer;
         self.size = (cols, rows);
 
-        // Clamp cursor to new size
-        self.cursor.0 = self.cursor.0.min(cols.saturating_sub(1));
-        self.cursor.1 = self.cursor.1.min(rows.saturating_sub(1));
+        // Clamp cursor positions and the scroll region to the new size
+        let max_x = cols.saturating_sub(1);
+        let max_y = rows.saturating_sub(1);
+        self.cursor.0 = self.cursor.0.min(max_x);
+        self.cursor.1 = self.cursor.1.min(max_y);
+        if let Some((x, y)) = self.saved_cursor {
+            self.saved_cursor = Some((x.min(max_x), y.min(max_y)));
+        }
+        if let Some((x, y)) = self.decsc_cursor {
+            self.decsc_cursor = Some((x.min(max_x), y.min(max_y)));
+        }
+        self.pending_wrap = false;
+        if let Some((top, bottom)) = self.scroll_region {
+            let top = top.min(max_y);
+            let bottom = bottom.min(max_y);
+            // A region that no longer spans at least two rows is meaningless;
+            // fall back to full-screen scrolling until the app resets it.
+            self.scroll_region = if top < bottom {
+                Some((top, bottom))
+            } else {
+                None
+            };
+        }
+    }
+
+    /// Copy `buffer` into a fresh `cols` x `rows` grid, keeping the top-left
+    /// overlap and blanking anything new.
+    fn resized_buffer(buffer: &[Vec<Cell>], cols: u16, rows: u16) -> Vec<Vec<Cell>> {
+        let mut new_buffer = vec![vec![Cell::new(); cols as usize]; rows as usize];
+        for (new_row, old_row) in new_buffer.iter_mut().zip(buffer.iter()) {
+            let copy_cols = (cols as usize).min(old_row.len());
+            new_row[..copy_cols].clone_from_slice(&old_row[..copy_cols]);
+        }
+        new_buffer
     }
 
     /// Clear the entire screen
@@ -286,9 +441,9 @@ impl Screen {
     /// Characters to the right shift right, rightmost characters are lost
     pub fn insert_chars(&mut self, n: u16) {
         let (x, y) = (self.cursor.0 as usize, self.cursor.1 as usize);
-        let cols = self.size.0 as usize;
 
         if let Some(row) = self.buffer.get_mut(y) {
+            let cols = row.len();
             for _ in 0..n {
                 if x < cols {
                     // Shift characters right
@@ -302,13 +457,24 @@ impl Screen {
         }
     }
 
+    /// Erase n characters at the cursor in place (ECH, `CSI n X`).
+    /// Unlike DCH nothing shifts; the cells simply become blank.
+    pub fn erase_chars(&mut self, n: u16) {
+        let (x, y) = (self.cursor.0 as usize, self.cursor.1 as usize);
+        if let Some(row) = self.buffer.get_mut(y) {
+            for cell in row.iter_mut().skip(x).take(n as usize) {
+                cell.clear();
+            }
+        }
+    }
+
     /// Delete n characters at cursor position
     /// Characters to the right shift left, blank characters appear at end
     pub fn delete_chars(&mut self, n: u16) {
         let (x, y) = (self.cursor.0 as usize, self.cursor.1 as usize);
-        let cols = self.size.0 as usize;
 
         if let Some(row) = self.buffer.get_mut(y) {
+            let cols = row.len();
             for _ in 0..n {
                 if x < cols {
                     // Shift characters left
@@ -345,19 +511,45 @@ impl Screen {
     /// Save current screen state (alternate buffer mode)
     /// Apps like vim use this to preserve shell content
     pub fn save_screen(&mut self) {
+        if self.in_alt_screen {
+            // Some apps re-emit 1049h; the main screen is already saved.
+            return;
+        }
+        self.in_alt_screen = true;
         self.saved_cursor = Some(self.cursor);
         self.saved_buffer = Some(self.buffer.clone());
+        self.pending_wrap = false;
     }
 
     /// Restore saved screen state
     /// Allows screen reader to return to previous content when app exits
     pub fn restore_screen(&mut self) {
+        if !self.in_alt_screen {
+            return;
+        }
+        self.in_alt_screen = false;
         if let Some(buffer) = self.saved_buffer.take() {
             self.buffer = buffer;
         }
         if let Some(cursor) = self.saved_cursor.take() {
             self.cursor = cursor;
         }
+        self.pending_wrap = false;
+    }
+
+    /// Full reset (RIS, `ESC c`): blank screen, cursor home, no scroll
+    /// region, no saved state.
+    pub fn reset(&mut self) {
+        self.clear();
+        self.cursor = (0, 0);
+        self.scroll_region = None;
+        self.saved_cursor = None;
+        self.decsc_cursor = None;
+        self.saved_buffer = None;
+        self.in_alt_screen = false;
+        self.charsets = [Charset::Ascii, Charset::Ascii];
+        self.active_charset = 0;
+        self.pending_wrap = false;
     }
 }
 
@@ -745,5 +937,112 @@ mod tests {
         for y in 0..5 {
             assert_eq!(screen.get_char(0, y as u16), Some((b'A' + y as u8) as char));
         }
+    }
+
+    #[test]
+    fn test_resize_while_in_alternate_screen_keeps_buffers_consistent() {
+        // Shell content on the main screen, then an app enters the alt screen.
+        let mut screen = Screen::new(10, 5);
+        screen.buffer[1][2].data = 'S';
+        screen.cursor = (9, 4);
+        screen.save_screen();
+        screen.clear();
+        screen.set_scroll_region(2, 5);
+
+        // Window is widened and made shorter while the app is running.
+        screen.resize(20, 3);
+        assert_eq!(screen.scroll_region, Some((1, 2)));
+
+        // App exits and restores the main screen: it must match the new size.
+        screen.restore_screen();
+        assert_eq!(screen.size, (20, 3));
+        assert_eq!(screen.buffer.len(), 3);
+        assert!(screen.buffer.iter().all(|row| row.len() == 20));
+        assert_eq!(screen.get_char(2, 1), Some('S'));
+        assert_eq!(screen.cursor, (9, 2));
+
+        // Row-level edits at the far right must not index out of bounds.
+        screen.cursor = (19, 2);
+        screen.insert_chars(3);
+        screen.delete_chars(3);
+        screen.cursor = (0, 2);
+        screen.insert_chars(1);
+        screen.delete_chars(1);
+    }
+
+    #[test]
+    fn test_resize_collapsed_scroll_region_resets_to_full_screen() {
+        let mut screen = Screen::new(10, 10);
+        screen.set_scroll_region(8, 10);
+        screen.resize(10, 8);
+        assert_eq!(screen.scroll_region, None);
+        // Scrolling must still work on the full screen afterwards.
+        screen.buffer[1][0].data = 'x';
+        screen.scroll_up(1);
+        assert_eq!(screen.get_char(0, 0), Some('x'));
+    }
+
+    #[test]
+    fn test_get_line_skips_wide_continuation_cells() {
+        let mut screen = Screen::new(6, 1);
+        screen.buffer[0][0].data = '日';
+        screen.buffer[0][1] = Cell::wide_continuation();
+        screen.buffer[0][2].data = 'x';
+        assert_eq!(screen.get_line_trimmed(0), "日x");
+        assert!(!screen.get_line(0).contains('\0'));
+    }
+
+    #[test]
+    fn test_text_range_linear_selection() {
+        let mut screen = Screen::new(10, 5);
+        for y in 0..5 {
+            let ch = (b'A' + y as u8) as char;
+            for x in 0..10 {
+                screen.buffer[y][x].data = ch;
+            }
+        }
+        assert_eq!(screen.text_range((2, 1), (5, 1)), "BBBB");
+        assert_eq!(screen.text_range((5, 1), (3, 2)), "BBBBB\nCCCC");
+        assert_eq!(screen.text_range((3, 2), (5, 1)), "BBBBB\nCCCC");
+        assert_eq!(screen.text_range((7, 1), (2, 3)), "BBB\nCCCCCCCCCC\nDDD");
+        assert_eq!(screen.text_range((5, 2), (5, 2)), "C");
+    }
+
+    #[test]
+    fn test_erase_chars_in_place() {
+        let mut screen = Screen::new(5, 1);
+        for x in 0..5 {
+            screen.buffer[0][x].data = (b'a' + x as u8) as char;
+        }
+        screen.cursor = (1, 0);
+        screen.erase_chars(2);
+        assert_eq!(screen.get_line(0), "a  de");
+        screen.erase_chars(100); // clamps to the row
+        assert_eq!(screen.get_line_trimmed(0), "a");
+    }
+
+    #[test]
+    fn test_nested_alt_screen_entry_keeps_main_screen() {
+        let mut screen = Screen::new(5, 2);
+        screen.buffer[0][0].data = 'M';
+        screen.save_screen();
+        screen.clear();
+        screen.buffer[0][0].data = 'A';
+        screen.save_screen(); // re-entry must not save alt content
+        screen.restore_screen();
+        assert_eq!(screen.get_char(0, 0), Some('M'));
+        assert!(!screen.in_alt_screen);
+        screen.restore_screen(); // spurious exit is a no-op
+        assert_eq!(screen.get_char(0, 0), Some('M'));
+    }
+
+    #[test]
+    fn test_text_range_trims_trailing_spaces_per_row() {
+        let mut screen = Screen::new(8, 2);
+        for (x, ch) in "ab".chars().enumerate() {
+            screen.buffer[0][x].data = ch;
+        }
+        screen.buffer[1][0].data = 'c';
+        assert_eq!(screen.text_range((0, 0), (7, 1)), "ab\nc");
     }
 }

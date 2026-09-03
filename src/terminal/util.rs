@@ -1,42 +1,53 @@
 //! Terminal utilities
 
-use crate::Result;
+use crate::{Result, TdsrError};
 use nix::libc;
 use std::os::unix::io::RawFd;
 
-/// Get the terminal size for the given file descriptor
+/// Size assumed when the terminal reports none (or reports zero columns/rows,
+/// which happens under `script`, some CI runners and detached sessions).
+const FALLBACK_SIZE: (u16, u16) = (80, 24);
+
+/// Get the terminal size for the given file descriptor as (cols, rows).
 ///
-/// Screen reader needs to know terminal dimensions to properly
-/// size the screen buffer and PTY.
+/// Screen reader needs to know terminal dimensions to properly size the
+/// screen buffer and PTY. Never returns a zero dimension: the screen buffer
+/// code assumes at least one column and one row.
 pub fn get_terminal_size(fd: RawFd) -> Result<(u16, u16)> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
 
+    // Safety: TIOCGWINSZ writes a winsize into the pointed-to struct.
     let result = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
 
-    if result == 0 {
+    if result == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
         Ok((ws.ws_col, ws.ws_row))
     } else {
-        // Default size if ioctl fails
-        Ok((80, 24))
+        Ok(FALLBACK_SIZE)
     }
 }
 
-/// Set raw mode on a terminal file descriptor
+/// Set raw mode on a terminal file descriptor, returning the previous
+/// attributes so they can be restored on exit.
 ///
 /// Raw mode is required for the screen reader to capture all keypresses
 /// including control characters and escape sequences.
 pub fn set_raw_mode(fd: RawFd) -> Result<libc::termios> {
-    let original_termios = unsafe {
-        let mut termios: libc::termios = std::mem::zeroed();
-        libc::tcgetattr(fd, &mut termios);
-        termios
-    };
+    let mut original_termios: libc::termios = unsafe { std::mem::zeroed() };
+
+    // Safety: tcgetattr fills the struct; we check its result so we never
+    // "restore" zeroed attributes later.
+    if unsafe { libc::tcgetattr(fd, &mut original_termios) } != 0 {
+        return Err(TdsrError::Io(std::io::Error::last_os_error()));
+    }
 
     let mut raw_termios = original_termios;
 
+    // Safety: cfmakeraw/tcsetattr operate on the struct we own.
     unsafe {
         libc::cfmakeraw(&mut raw_termios);
-        libc::tcsetattr(fd, libc::TCSANOW, &raw_termios);
+        if libc::tcsetattr(fd, libc::TCSANOW, &raw_termios) != 0 {
+            return Err(TdsrError::Io(std::io::Error::last_os_error()));
+        }
     }
 
     Ok(original_termios)
@@ -46,6 +57,7 @@ pub fn set_raw_mode(fd: RawFd) -> Result<libc::termios> {
 ///
 /// Called when screen reader exits to return terminal to normal state
 pub fn restore_termios(fd: RawFd, termios: &libc::termios) {
+    // Safety: restoring attributes previously obtained from tcgetattr.
     unsafe {
         libc::tcsetattr(fd, libc::TCSANOW, termios);
     }

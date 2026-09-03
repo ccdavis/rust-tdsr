@@ -130,8 +130,15 @@ TDSR uses native speech synthesis:
 - **WSL:** PulseAudio + espeak-ng (via WSLG), Windows SAPI fallback, Speech Dispatcher fallback
 - **macOS:** AVFoundation (built into macOS 10.14+)
 
+Any platform can instead use an external speech server: set `speech_command`
+(or pass `--speech-command "..."` on the command line) to a program that reads
+the TDSR line protocol on stdin (`s<text>`, `l<char>`, `x` cancel, `r<0-100>`,
+`v<0-100>`, `V<index>`, one command per line). This is the same protocol the
+original Python TDSR's speech servers used, so those scripts work unchanged.
+
 ```ini
 [speech]
+speech_command = python3 /path/to/my_server.py   # optional external synth
 rate = 50           # Speech rate: 0 (slowest) to 100 (fastest), default 50
 volume = 80         # Volume: 0 (quietest) to 100 (loudest), default 80
 voice_idx = 0       # Voice index (see voice table below)
@@ -342,7 +349,7 @@ Press `Alt+d` to run!
 - **Speech System** - Native TTS backends:
   - Linux: Speech Dispatcher via `tts` crate, or PulseAudio + espeak-ng
   - WSL: PulseAudio + espeak-ng (WSLG), Windows SAPI fallback, Speech Dispatcher fallback
-  - macOS: AVFoundation via `tts` crate
+  - macOS: AVFoundation, driven by a `tdsr --speech-server` subprocess (the `tts` crate is not used on macOS)
   - Optional: MBROLA voices for higher quality speech (Linux/WSL)
 - **Input Handling** - Modal key handler stack
 - **Plugin System** - JSON subprocess protocol
@@ -385,13 +392,21 @@ cargo clippy
 
 ### Speech Not Working (macOS)
 
+TDSR speaks through a helper process, `tdsr --speech-server`, that it starts
+from its own executable. If that helper cannot be started, TDSR announces the
+reason through the system `say` command and exits (it never runs silently).
+
 ```bash
 # Test system speech works
 say "Hello from macOS"
 
-# If that works but TDSR doesn't, run with debug logging:
-RUST_LOG=debug tdsr --debug
-cat tdsr.log | grep -i speech
+# Test the helper directly: it should speak "hello" and exit when stdin closes
+printf 'shello\n' | tdsr --speech-server
+
+# If that works but TDSR doesn't, run with debug logging (the helper logs to
+# the same tdsr.log):
+tdsr --debug
+grep -i speech tdsr.log
 
 # Check macOS version (requires 10.14+)
 sw_vers

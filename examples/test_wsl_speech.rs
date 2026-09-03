@@ -10,7 +10,7 @@ fn main() {
     println!("Testing WSL speech synthesis...");
     println!("Creating synthesizer...");
 
-    let mut synth = match create_synth() {
+    let mut synth = match create_synth(None) {
         Ok(s) => {
             println!("✓ Synthesizer created successfully");
             s

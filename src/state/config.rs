@@ -36,9 +36,14 @@ pub struct Config {
 }
 
 impl Config {
-    /// Load configuration from disk or create default
+    /// Load configuration from `~/.tdsr.cfg`, creating it with defaults if absent
     pub fn load() -> Result<Self> {
-        let path = Self::config_path();
+        Self::load_from(Self::config_path())
+    }
+
+    /// Load configuration from an explicit path, creating it with defaults if
+    /// absent. Later `save()` calls write back to the same path.
+    pub fn load_from(path: PathBuf) -> Result<Self> {
         debug!("Loading config from {:?}", path);
 
         let ini = if path.exists() {
@@ -308,6 +313,17 @@ impl Config {
     /// Voice index for TTS engine
     pub fn voice_idx(&self) -> Option<usize> {
         self.get_int("speech", "voice_idx", -1).try_into().ok()
+    }
+
+    /// External speech server command (`[speech] speech_command`), if set.
+    ///
+    /// The command is started once and driven over its stdin with the
+    /// original TDSR line protocol (`s<text>`, `l<char>`, `x`, `r<0-100>`,
+    /// `v<0-100>`, `V<idx>`), so any program that speaks it can be used.
+    pub fn speech_command(&self) -> Option<String> {
+        let cmd = self.get_string("speech", "speech_command", "");
+        let cmd = cmd.trim();
+        (!cmd.is_empty()).then(|| cmd.to_string())
     }
 
     /// Prompt pattern for plugin line collection

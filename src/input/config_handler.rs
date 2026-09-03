@@ -22,8 +22,16 @@ use log::debug;
 /// - c: toggle cursor tracking
 /// - l: toggle line pause
 /// - s: toggle repeated symbols
-/// - Enter: exit and save config
+/// - ?: list the keys
+/// - Enter or Escape: leave the menu
+///
+/// Unknown keys are announced so a user who mistyped is not left in silence.
 pub struct ConfigHandler;
+
+/// Spoken on `?` and after an unknown key.
+const CONFIG_HELP: &str = "config keys: r rate, v volume, capital V voice, d delay, \
+p symbols, e character echo, c cursor tracking, l line pause, s repeated symbols, \
+enter or escape to exit";
 
 impl Default for ConfigHandler {
     fn default() -> Self {
@@ -73,7 +81,7 @@ impl ConfigHandler {
             // Voice index setting
             b"V" => {
                 debug!("Config: voice index");
-                state.speak("voice")?;
+                state.speak("voice index")?;
                 state
                     .handlers
                     .push(Box::new(super::buffer_handler::BufferHandler::new(
@@ -104,7 +112,7 @@ impl ConfigHandler {
             // Set cursor delay
             b"d" => {
                 debug!("Config: cursor delay");
-                state.speak("delay")?;
+                state.speak("cursor delay")?;
                 state
                     .handlers
                     .push(Box::new(super::buffer_handler::BufferHandler::new(
@@ -125,9 +133,9 @@ impl ConfigHandler {
                     .set("speech", "key_echo", &new_value.to_string());
                 state.save_config()?;
                 state.speak(if new_value {
-                    "key echo on"
+                    "character echo on"
                 } else {
-                    "key echo off"
+                    "character echo off"
                 })?;
                 Ok(HandlerAction::Handled)
             }
@@ -183,15 +191,27 @@ impl ConfigHandler {
                 Ok(HandlerAction::Handled)
             }
 
-            // Enter - exit config menu
-            b"\r" | b"\n" => {
+            // Help
+            b"?" => {
+                state.speak(CONFIG_HELP)?;
+                Ok(HandlerAction::Handled)
+            }
+
+            // Enter or Escape - exit config menu
+            b"\r" | b"\n" | b"\x1b" => {
                 debug!("Config: exit");
+                state.speak("exit")?;
                 Ok(HandlerAction::Remove)
             }
 
-            // Unknown key in config menu
+            // Unknown key in config menu: say so, and stay in the menu
             _ => {
-                debug!("Config: unknown key");
+                debug!("Config: unknown key {:?}", key);
+                let name = describe_key(key, state);
+                state.speak(&format!(
+                    "{} is not a config key, press question mark for help",
+                    name
+                ))?;
                 Ok(HandlerAction::Handled)
             }
         }
@@ -270,12 +290,25 @@ impl ConfigHandler {
     }
 }
 
-impl KeyHandler for ConfigHandler {
-    fn process(&mut self, _key: &[u8]) -> Result<HandlerAction> {
-        // This shouldn't be called directly - use process_with_state instead
-        Ok(HandlerAction::Handled)
+/// Human-readable name for a key sequence, for error feedback.
+fn describe_key(key: &[u8], state: &State) -> String {
+    match key {
+        [b] if b.is_ascii_graphic() => state
+            .config
+            .symbols
+            .get(&(*b as u32))
+            .cloned()
+            .unwrap_or_else(|| (*b as char).to_string()),
+        [b' '] => "space".to_string(),
+        [b'\x7f'] | [b'\x08'] => "backspace".to_string(),
+        [b'\t'] => "tab".to_string(),
+        [0x1b, b] if b.is_ascii_graphic() => format!("alt {}", *b as char),
+        [b] if b.is_ascii_control() => format!("control {}", (b + b'@') as char),
+        _ => "that key".to_string(),
     }
+}
 
+impl KeyHandler for ConfigHandler {
     fn process_with_context(
         &mut self,
         key: &[u8],

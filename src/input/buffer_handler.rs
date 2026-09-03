@@ -1,7 +1,7 @@
-//! Buffer handler for collecting text input
+//! Buffer handler for collecting numeric input
 //!
-//! Used when screen reader needs to collect user input
-//! (e.g., entering a rate value in config menu)
+//! Used when the screen reader needs a number from the user (rate, volume,
+//! voice index, cursor delay in the config menu).
 
 use super::{HandlerAction, KeyHandler};
 use crate::state::State;
@@ -12,10 +12,11 @@ use log::debug;
 /// Callback function type for when input is complete
 type OnAcceptFn = Box<dyn FnOnce(String, &mut State) -> Result<()> + Send>;
 
-/// Handler that collects text input until Enter is pressed
+/// Handler that collects digits until Enter is pressed
 ///
-/// Used for numeric input in config menu and other text entry scenarios.
-/// When user presses Enter, calls the provided callback with the collected text.
+/// Every accepted digit is spoken, backspace speaks the digit it removed,
+/// non-digits are rejected with a spoken message, and Escape (or Enter on an
+/// empty buffer) cancels without calling the callback.
 pub struct BufferHandler {
     /// Accumulated input buffer
     buffer: String,
@@ -38,35 +39,51 @@ impl BufferHandler {
     /// Process input with state access
     pub fn process_with_state(&mut self, key: &[u8], state: &mut State) -> Result<HandlerAction> {
         match key {
-            // Enter - accept input and invoke callback
+            // Enter - accept input and invoke callback (empty input cancels)
             b"\r" | b"\n" => {
-                debug!("BufferHandler: accepting input '{}'", self.buffer);
-
-                if let Some(callback) = self.on_accept.take() {
-                    callback(self.buffer.clone(), state)?;
+                if self.buffer.is_empty() {
+                    debug!("BufferHandler: empty input, cancelled");
+                    state.speak("cancelled")?;
+                    return Ok(HandlerAction::Remove);
                 }
-
-                // Remove this handler from stack
+                debug!("BufferHandler: accepting input '{}'", self.buffer);
+                if let Some(callback) = self.on_accept.take() {
+                    callback(std::mem::take(&mut self.buffer), state)?;
+                }
                 Ok(HandlerAction::Remove)
             }
 
-            // Backspace - remove last character
+            // Escape - cancel
+            b"\x1b" => {
+                debug!("BufferHandler: cancelled");
+                state.speak("cancelled")?;
+                Ok(HandlerAction::Remove)
+            }
+
+            // Backspace - remove last digit and say which one
             b"\x08" | b"\x7f" => {
-                if !self.buffer.is_empty() {
-                    self.buffer.pop();
-                    debug!("BufferHandler: backspace, buffer now '{}'", self.buffer);
-                    // TODO: Phase 5 - Echo the backspace
+                match self.buffer.pop() {
+                    Some(removed) => {
+                        debug!("BufferHandler: backspace, buffer now '{}'", self.buffer);
+                        state.speak(&format!("deleted {}", removed))?;
+                    }
+                    None => state.speak("empty")?,
                 }
                 Ok(HandlerAction::Handled)
             }
 
-            // Regular character - add to buffer
+            // A digit - add to buffer and echo it
+            [d] if d.is_ascii_digit() => {
+                self.buffer.push(*d as char);
+                debug!("BufferHandler: buffer now '{}'", self.buffer);
+                state.speak_char(*d as char)?;
+                Ok(HandlerAction::Handled)
+            }
+
+            // Anything else is rejected, with feedback
             _ => {
-                if let Ok(s) = std::str::from_utf8(key) {
-                    self.buffer.push_str(s);
-                    debug!("BufferHandler: added '{}', buffer now '{}'", s, self.buffer);
-                    // TODO: Phase 5 - Echo the character if key_echo is on
-                }
+                debug!("BufferHandler: rejected {:?}", key);
+                state.speak("digits only")?;
                 Ok(HandlerAction::Handled)
             }
         }
@@ -74,11 +91,6 @@ impl BufferHandler {
 }
 
 impl KeyHandler for BufferHandler {
-    fn process(&mut self, _key: &[u8]) -> Result<HandlerAction> {
-        // This shouldn't be called directly - use process_with_state instead
-        Ok(HandlerAction::Handled)
-    }
-
     fn process_with_context(
         &mut self,
         key: &[u8],

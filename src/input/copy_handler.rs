@@ -97,11 +97,6 @@ impl CopyHandler {
 }
 
 impl KeyHandler for CopyHandler {
-    fn process(&mut self, _key: &[u8]) -> Result<HandlerAction> {
-        // This shouldn't be called directly - use process_with_context instead
-        Ok(HandlerAction::Handled)
-    }
-
     fn process_with_context(
         &mut self,
         key: &[u8],

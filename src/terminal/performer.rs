@@ -2,11 +2,11 @@
 //!
 //! Separated from Emulator to avoid borrow checker issues
 
-use super::{Cell, Screen};
+use super::{Cell, Charset, Screen};
 use crate::speech::SpeechBuffer;
 use log::trace;
 use unicode_width::UnicodeWidthChar;
-use vte::Perform;
+use vte::{Params, Perform};
 
 /// Performer that updates the screen buffer in response to terminal sequences
 ///
@@ -17,33 +17,88 @@ use vte::Perform;
 pub struct ScreenPerformer<'a> {
     pub screen: &'a mut Screen,
     pub speech_buffer: &'a mut SpeechBuffer,
+    /// Position where the *next* character would land if output continued
+    /// uninterrupted: the cell after the last printed one. Printing anywhere
+    /// else means the cursor jumped, and speech gets a separator so words
+    /// drawn in different places don't run together.
     pub last_drawn: &'a mut (u16, u16),
     /// When true, insert line breaks in speech buffer at newlines
     pub line_pause: bool,
+    /// The character the user just typed, if any. The first character the
+    /// terminal draws afterwards is compared against it: a match is the
+    /// shell echoing the keystroke, which is reported in `echoed` and kept
+    /// out of the speech buffer (key echo speaks it separately). Cleared by
+    /// the first draw either way, as in the original TDSR.
+    pub echo_key: &'a mut Option<char>,
+    /// Set when a drawn character matched `echo_key`.
+    pub echoed: Option<char>,
 }
 
-impl<'a> ScreenPerformer<'a> {
-    /// Check if we should add space to speech buffer
-    ///
-    /// Screen reader adds spaces when cursor jumps (non-continuous drawing)
-    fn should_add_space(&self) -> bool {
-        let (x, y) = self.screen.cursor;
-        let (last_x, last_y) = *self.last_drawn;
-
-        // If on same line but cursor jumped forward
-        if y == last_y && x > last_x + 1 {
-            return true;
-        }
-
-        false
+/// Numeric CSI parameter `idx`, or `default` when absent or zero (for CSI
+/// commands where 0 means "default", which is all cursor/edit commands).
+fn param(params: &Params, idx: usize, default: u16) -> u16 {
+    match params.iter().nth(idx).and_then(|p| p.first().copied()) {
+        Some(0) | None => default,
+        Some(n) => n,
     }
 }
 
 impl<'a> ScreenPerformer<'a> {
+    /// Bottom row of the scroll region (or of the screen)
+    fn region_bottom(&self) -> u16 {
+        self.screen
+            .scroll_region
+            .map_or(self.screen.size.1.saturating_sub(1), |(_, b)| b)
+    }
+
+    /// Top row of the scroll region (or of the screen)
+    fn region_top(&self) -> u16 {
+        self.screen.scroll_region.map_or(0, |(t, _)| t)
+    }
+
+    /// Move down one row, scrolling the region when at its bottom (LF/IND)
+    fn linefeed(&mut self) {
+        if self.screen.cursor.1 >= self.region_bottom() {
+            self.screen.scroll_up(1);
+        } else {
+            self.screen.cursor.1 += 1;
+        }
+    }
+
+    /// Speech separator for a line break: a pause in line_pause mode,
+    /// otherwise a space so words on adjacent lines don't merge
+    fn speech_line_break(&mut self) {
+        if self.line_pause {
+            self.speech_buffer.line_break();
+        } else {
+            self.speech_buffer.push(' ');
+            self.speech_buffer.begin_row();
+        }
+    }
+
+    /// After a line feed the separator is already in the buffer; make the
+    /// cursor's new position count as "continuing" so the next character
+    /// doesn't add a second one.
+    fn continue_at_cursor(&mut self) {
+        *self.last_drawn = self.screen.cursor;
+    }
+
+    /// The cursor moved to a (possibly) different row by an explicit
+    /// command: cancel any pending auto-wrap and, when landing at the start
+    /// of the row that is currently being drawn, treat further text as a
+    /// rewrite of that row (status lines redrawn with CUP/CHA).
+    fn cursor_moved(&mut self) {
+        self.screen.pending_wrap = false;
+        let (x, y) = self.screen.cursor;
+        if x == 0 && y == self.last_drawn.1 {
+            self.speech_buffer.mark_overwrite();
+        }
+    }
+
     /// Handle private CSI modes (CSI ? Pn h/l)
     ///
     /// These control terminal modes like alternate screen, cursor visibility, etc.
-    fn handle_private_mode(&mut self, params: &vte::Params, action: char) {
+    fn handle_private_mode(&mut self, params: &Params, action: char) {
         let mode = params
             .iter()
             .next()
@@ -52,37 +107,21 @@ impl<'a> ScreenPerformer<'a> {
 
         match (mode, action) {
             // CSI ?1049h - Save cursor + switch to alternate screen + clear
-            (1049, 'h') => {
-                trace!("Entering alternate screen mode (1049)");
+            // CSI ?47h / ?1047h - Switch to alternate screen
+            (1049 | 47 | 1047, 'h') => {
+                trace!("Entering alternate screen mode ({})", mode);
                 self.screen.save_screen();
                 self.screen.clear();
-                self.screen.cursor = (0, 0);
+                if mode == 1049 {
+                    self.screen.cursor = (0, 0);
+                }
+                self.speech_buffer.begin_row();
             }
-            // CSI ?1049l - Restore from alternate screen + restore cursor
-            (1049, 'l') => {
-                trace!("Leaving alternate screen mode (1049)");
+            // CSI ?1049l / ?47l / ?1047l - Restore from alternate screen
+            (1049 | 47 | 1047, 'l') => {
+                trace!("Leaving alternate screen mode ({})", mode);
                 self.screen.restore_screen();
-            }
-            // CSI ?47h - Switch to alternate screen (no cursor save)
-            (47, 'h') => {
-                trace!("Entering alternate screen mode (47)");
-                self.screen.save_screen();
-                self.screen.clear();
-            }
-            // CSI ?47l - Restore from alternate screen
-            (47, 'l') => {
-                trace!("Leaving alternate screen mode (47)");
-                self.screen.restore_screen();
-            }
-            // CSI ?1047h/l - Same as 47 but also clears on enter
-            (1047, 'h') => {
-                trace!("Entering alternate screen mode (1047)");
-                self.screen.save_screen();
-                self.screen.clear();
-            }
-            (1047, 'l') => {
-                trace!("Leaving alternate screen mode (1047)");
-                self.screen.restore_screen();
+                self.speech_buffer.begin_row();
             }
             _ => {
                 trace!("Unhandled private mode: ?{}{}", mode, action);
@@ -98,44 +137,71 @@ impl<'a> Perform for ScreenPerformer<'a> {
     /// buffer so the screen reader can read it back. We handle wide characters
     /// (CJK, emoji) by marking continuation cells.
     ///
-    /// Auto-wrap behavior (DECAWM mode, enabled by default):
-    /// - When cursor is at or past the right margin and a new character arrives,
-    ///   wrap to the beginning of the next line before printing
-    /// - If already at the bottom line, scroll the screen up first
+    /// Auto-wrap behavior (DECAWM mode, enabled by default): printing in the
+    /// last column leaves the cursor there with `pending_wrap` set; the next
+    /// character wraps to the start of the following line first, scrolling
+    /// the region when already at its bottom. A wide character that doesn't
+    /// fit in the remaining columns wraps too.
     fn print(&mut self, c: char) {
         let (cols, rows) = self.screen.size;
-        let (_top, bottom) = self
-            .screen
-            .scroll_region
-            .unwrap_or((0, self.screen.size.1 - 1));
+        if cols == 0 || rows == 0 {
+            return;
+        }
 
-        // Get character width for proper cursor advancement
-        let width = c.width().unwrap_or(1) as u16;
+        // Zero-width characters (combining marks, variation selectors, ZWJ)
+        // attach to the previous glyph. Our one-char cells can't hold them,
+        // so they go to speech only and leave the cursor alone.
+        let width = c.width().unwrap_or(0) as u16;
+        if width == 0 {
+            self.speech_buffer.push(c);
+            return;
+        }
 
-        // Handle auto-wrap: if cursor is at or past right margin, wrap to next line
-        // This implements DECAWM (auto-wrap mode) which is enabled by default
-        if self.screen.cursor.0 >= cols {
+        // DEC special graphics (box drawing) when that charset is active
+        let c = self.screen.map_charset(c);
+
+        // Is this the shell echoing the key the user just typed?
+        let is_echo = self.echo_key.take() == Some(c);
+        if is_echo {
+            self.echoed = Some(c);
+        }
+
+        let mut wrapped = false;
+        if self.screen.pending_wrap || self.screen.cursor.0 + width > cols {
+            self.screen.pending_wrap = false;
             self.screen.cursor.0 = 0;
-            // Perform linefeed with scrolling, respecting scroll region
-            if self.screen.cursor.1 >= bottom {
-                // At bottom of scroll region - scroll up within region
-                self.screen.scroll_up(1);
-                // Cursor stays at bottom of region after scroll
-            } else {
-                self.screen.cursor.1 += 1;
-            }
+            self.linefeed();
+            wrapped = true;
         }
 
         let (x, y) = self.screen.cursor;
-
-        // Check if we're within bounds (should always be true after wrapping)
         if y >= rows || x >= cols {
             return;
         }
 
-        // Add space to speech buffer if cursor jumped
-        if self.should_add_space() {
-            self.speech_buffer.write(" ");
+        // Speech: text continuing right after the last printed character
+        // (including across an auto-wrap) is part of the same run. Anything
+        // else is a cursor jump and needs a separator — or, after a carriage
+        // return, replaces this row's queued text. An echoed keystroke is
+        // drawn but not queued.
+        let (last_x, last_y) = *self.last_drawn;
+        if is_echo {
+            // Nothing queued for it, but the run continues from here.
+        } else if !wrapped && (x, y) != (last_x, last_y) {
+            if y != last_y {
+                self.speech_buffer.begin_row();
+                if self.line_pause {
+                    self.speech_buffer.line_break();
+                } else {
+                    self.speech_buffer.push(' ');
+                }
+            } else if !self.speech_buffer.apply_overwrite() {
+                self.speech_buffer.push(' ');
+            }
+        } else if !wrapped {
+            // Continuing the row: a pending CR overwrite no longer applies
+            // once text resumes exactly where it left off.
+            self.speech_buffer.apply_overwrite();
         }
 
         // Write character to screen buffer
@@ -147,7 +213,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
 
             // For wide characters, mark the next cell as a continuation
             // Screen reader will skip these during character navigation
-            if width > 1 && (x + 1) < cols {
+            if width > 1 {
                 if let Some(next_cell) = row.get_mut((x + 1) as usize) {
                     *next_cell = Cell::wide_continuation();
                 }
@@ -155,14 +221,19 @@ impl<'a> Perform for ScreenPerformer<'a> {
         }
 
         // Add character to speech buffer for automatic reading
-        self.speech_buffer.write(&c.to_string());
+        if !is_echo {
+            self.speech_buffer.push(c);
+        }
 
-        // Update last drawn position for screen reader
-        *self.last_drawn = (x, y);
-
-        // Advance cursor - allow it to go to cols (one past the last column)
-        // to trigger wrapping on the next character
-        self.screen.cursor.0 = x + width;
+        // Advance the cursor; in the last column it stays put with a wrap pending
+        let next_x = x + width;
+        if next_x >= cols {
+            self.screen.cursor.0 = cols - 1;
+            self.screen.pending_wrap = true;
+        } else {
+            self.screen.cursor.0 = next_x;
+        }
+        *self.last_drawn = (next_x, y);
     }
 
     /// Execute a control character (e.g., \n, \r, \t)
@@ -170,41 +241,37 @@ impl<'a> Perform for ScreenPerformer<'a> {
         match byte {
             // Line feed - move cursor down, scrolling if at bottom
             // Screen reader can optionally pause speech at newlines
-            b'\n' => {
-                // If line_pause is enabled, segment speech at line breaks
-                if self.line_pause {
-                    self.speech_buffer.line_break();
-                } else {
-                    // Without line pause, add a space for continuity
-                    self.speech_buffer.write(" ");
-                }
-
-                let (_, bottom) = self
-                    .screen
-                    .scroll_region
-                    .unwrap_or((0, self.screen.size.1 - 1));
-                if self.screen.cursor.1 >= bottom {
-                    // At bottom of scroll region - scroll up to make room
-                    self.screen.scroll_up(1);
-                    // Cursor stays at bottom of region after scroll
-                } else {
-                    self.screen.cursor.1 += 1;
-                }
+            b'\n' | b'\x0b' | b'\x0c' => {
+                self.speech_line_break();
+                self.screen.pending_wrap = false;
+                self.linefeed();
+                self.continue_at_cursor();
             }
-            // Carriage return - move cursor to start of line
+            // Carriage return - move cursor to start of line. Text drawn next
+            // overwrites this row, so it replaces the row's queued speech
+            // (progress bars); a following LF cancels that (normal CRLF).
             b'\r' => {
                 self.screen.cursor.0 = 0;
+                self.screen.pending_wrap = false;
+                if self.screen.cursor.1 == self.last_drawn.1 {
+                    self.speech_buffer.mark_overwrite();
+                }
             }
             // Tab - advance to next tab stop (every 8 columns)
             // Add space to speech for clarity
             b'\t' => {
-                self.speech_buffer.write(" ");
-                self.screen.cursor.0 = ((self.screen.cursor.0 / 8) + 1) * 8;
-                self.screen.cursor.0 = self.screen.cursor.0.min(self.screen.size.0 - 1);
+                self.speech_buffer.push(' ');
+                self.screen.pending_wrap = false;
+                let next = ((self.screen.cursor.0 / 8) + 1) * 8;
+                self.screen.cursor.0 = next.min(self.screen.size.0.saturating_sub(1));
             }
+            // Shift Out / Shift In: select G1 / G0 character set
+            b'\x0e' => self.screen.active_charset = 1,
+            b'\x0f' => self.screen.active_charset = 0,
             // Backspace - move cursor left
             // Speech buffer position is adjusted by removing last char
             b'\x08' => {
+                self.screen.pending_wrap = false;
                 if self.screen.cursor.0 > 0 {
                     self.screen.cursor.0 -= 1;
                     // Remove last character from speech buffer - O(1) operation
@@ -221,221 +288,142 @@ impl<'a> Perform for ScreenPerformer<'a> {
     ///
     /// These control cursor movement, clearing, colors, etc.
     /// Screen reader needs to track cursor position and screen content changes.
-    fn csi_dispatch(
-        &mut self,
-        params: &vte::Params,
-        intermediates: &[u8],
-        _ignore: bool,
-        action: char,
-    ) {
-        // Handle private modes (CSI ? Pn h/l)
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         if intermediates.first() == Some(&b'?') {
             self.handle_private_mode(params, action);
             return;
         }
 
-        match action {
-            // Cursor movement commands
-            'H' | 'f' => {
-                // Cursor position: CSI row;col H
-                let row = params
-                    .iter()
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1)
-                    .saturating_sub(1);
-                let col = params
-                    .iter()
-                    .nth(1)
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1)
-                    .saturating_sub(1);
+        let (cols, rows) = self.screen.size;
+        let max_x = cols.saturating_sub(1);
+        let max_y = rows.saturating_sub(1);
+        let (x, y) = self.screen.cursor;
 
-                self.screen.cursor = (
-                    col.min(self.screen.size.0 - 1),
-                    row.min(self.screen.size.1 - 1),
-                );
+        match action {
+            // Cursor position: CSI row;col H (1-based; 0 or absent means 1)
+            'H' | 'f' => {
+                let row = param(params, 0, 1) - 1;
+                let col = param(params, 1, 1) - 1;
+                self.screen.set_cursor(col, row);
+                self.cursor_moved();
             }
+            // Cursor up, stopping at the top margin when inside the region
             'A' => {
-                // Cursor up
-                let n = params
-                    .iter()
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1);
-                self.screen.cursor.1 = self.screen.cursor.1.saturating_sub(n);
+                let top = if y >= self.region_top() {
+                    self.region_top()
+                } else {
+                    0
+                };
+                let new_y = y.saturating_sub(param(params, 0, 1)).max(top);
+                self.screen.set_cursor(x, new_y);
+                self.cursor_moved();
             }
+            // Cursor down, stopping at the bottom margin when inside the region
             'B' => {
-                // Cursor down
-                let n = params
-                    .iter()
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1);
-                self.screen.cursor.1 = (self.screen.cursor.1 + n).min(self.screen.size.1 - 1);
+                let bottom = if y <= self.region_bottom() {
+                    self.region_bottom()
+                } else {
+                    max_y
+                };
+                let new_y = (y + param(params, 0, 1)).min(bottom);
+                self.screen.set_cursor(x, new_y);
+                self.cursor_moved();
             }
+            // Cursor right
             'C' => {
-                // Cursor right
-                let n = params
-                    .iter()
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1);
-                self.screen.cursor.0 = (self.screen.cursor.0 + n).min(self.screen.size.0 - 1);
+                let new_x = (x + param(params, 0, 1)).min(max_x);
+                self.screen.set_cursor(new_x, y);
+                self.cursor_moved();
             }
+            // Cursor left
             'D' => {
-                // Cursor left
-                let n = params
-                    .iter()
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1);
-                self.screen.cursor.0 = self.screen.cursor.0.saturating_sub(n);
+                let new_x = x.saturating_sub(param(params, 0, 1));
+                self.screen.set_cursor(new_x, y);
+                self.cursor_moved();
+            }
+            // Cursor next line (CNL) / previous line (CPL): move rows, column 0
+            'E' => {
+                let new_y = (y + param(params, 0, 1)).min(max_y);
+                self.screen.set_cursor(0, new_y);
+                self.cursor_moved();
+            }
+            'F' => {
+                let new_y = y.saturating_sub(param(params, 0, 1));
+                self.screen.set_cursor(0, new_y);
+                self.cursor_moved();
+            }
+            // Cursor Character Absolute (CHA) / Horizontal Position Absolute (HPA)
+            'G' | '`' => {
+                let col = param(params, 0, 1) - 1;
+                self.screen.set_cursor(col, y);
+                self.cursor_moved();
+            }
+            // Line Position Absolute (VPA) - CSI n d
+            'd' => {
+                let row = param(params, 0, 1) - 1;
+                self.screen.set_cursor(x, row);
+                self.cursor_moved();
             }
 
             // Erase commands - important for screen reader to know when content is cleared
             'J' => {
-                let mode = params
-                    .iter()
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(0);
-                match mode {
+                self.screen.pending_wrap = false;
+                match param(params, 0, 0) {
                     0 => self.screen.clear_to_end(),   // Clear to end of screen
                     1 => self.screen.clear_to_start(), // Clear to start of screen
-                    2 | 3 => self.screen.clear(),      // Clear entire screen
+                    2 => self.screen.clear(),          // Clear entire screen
+                    // 3 clears the scrollback in xterm; the screen is untouched
                     _ => {}
                 }
             }
             'K' => {
                 // Erase line
-                let mode = params
-                    .iter()
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(0);
-                let (x, y) = self.screen.cursor;
-
+                self.screen.pending_wrap = false;
+                let mode = param(params, 0, 0);
                 if let Some(row) = self.screen.buffer.get_mut(y as usize) {
                     match mode {
-                        0 => {
-                            // Clear to end of line
-                            for cell in row.iter_mut().skip(x as usize) {
-                                cell.clear();
-                            }
-                        }
-                        1 => {
-                            // Clear to start of line
-                            for cell in row.iter_mut().take(x as usize + 1) {
-                                cell.clear();
-                            }
-                        }
-                        2 => {
-                            // Clear entire line
-                            for cell in row {
-                                cell.clear();
-                            }
-                        }
+                        // Clear to end of line
+                        0 => row.iter_mut().skip(x as usize).for_each(Cell::clear),
+                        // Clear to start of line
+                        1 => row.iter_mut().take(x as usize + 1).for_each(Cell::clear),
+                        // Clear entire line
+                        2 => row.iter_mut().for_each(Cell::clear),
                         _ => {}
                     }
                 }
             }
+            // Erase characters in place (ECH) - used heavily by ncurses and zsh
+            'X' => {
+                self.screen.pending_wrap = false;
+                self.screen.erase_chars(param(params, 0, 1));
+            }
 
             // Scrolling - important for screen reader to track content movement
-            'S' => {
-                // Scroll up
-                let n = params
-                    .iter()
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1);
-                self.screen.scroll_up(n);
-            }
-            'T' => {
-                // Scroll down
-                let n = params
-                    .iter()
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1);
-                self.screen.scroll_down(n);
-            }
+            'S' => self.screen.scroll_up(param(params, 0, 1)),
+            'T' => self.screen.scroll_down(param(params, 0, 1)),
 
             // Insert lines (IL) - insert blank lines at cursor
-            'L' => {
-                let n = params
-                    .iter()
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1);
-                self.screen.insert_lines(n);
-            }
-
+            'L' => self.screen.insert_lines(param(params, 0, 1)),
             // Delete lines (DL) - delete lines at cursor
-            'M' => {
-                let n = params
-                    .iter()
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1);
-                self.screen.delete_lines(n);
-            }
+            'M' => self.screen.delete_lines(param(params, 0, 1)),
 
             // Delete characters (DCH) - delete chars at cursor
             'P' => {
-                let n = params
-                    .iter()
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1);
-                self.screen.delete_chars(n);
+                self.screen.pending_wrap = false;
+                self.screen.delete_chars(param(params, 0, 1));
             }
-
             // Insert characters (ICH) - insert blank chars at cursor
             '@' => {
-                let n = params
-                    .iter()
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1);
-                self.screen.insert_chars(n);
+                self.screen.pending_wrap = false;
+                self.screen.insert_chars(param(params, 0, 1));
             }
 
             // Set scroll region (DECSTBM) - CSI top;bottom r
             'r' => {
-                let top = params
-                    .iter()
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1);
-                let bottom = params
-                    .iter()
-                    .nth(1)
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(self.screen.size.1);
+                let top = param(params, 0, 1);
+                let bottom = param(params, 1, rows);
                 self.screen.set_scroll_region(top, bottom);
-            }
-
-            // Line Position Absolute (VPA) - CSI n d
-            'd' => {
-                let row = params
-                    .iter()
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1)
-                    .saturating_sub(1);
-                self.screen.cursor.1 = row.min(self.screen.size.1 - 1);
-            }
-
-            // Cursor Character Absolute (CHA) - CSI n G
-            'G' => {
-                let col = params
-                    .iter()
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1)
-                    .saturating_sub(1);
-                self.screen.cursor.0 = col.min(self.screen.size.0 - 1);
+                self.cursor_moved();
             }
 
             _ => {
@@ -444,8 +432,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
         }
     }
 
-    fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {
-    }
+    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
@@ -458,8 +445,21 @@ impl<'a> Perform for ScreenPerformer<'a> {
     /// - ESC M: Reverse index (move up, scroll down if at top)
     /// - ESC D: Index (move down, scroll up if at bottom)
     /// - ESC E: Next line (CR + LF)
+    /// - ESC c: Full reset (RIS)
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
-        // Handle sequences with intermediates (like ESC # 8 for DECALN)
+        // Charset designation: ESC ( x -> G0, ESC ) x -> G1. `0` is the DEC
+        // special graphics (line drawing) set; anything else is treated as
+        // plain text.
+        if let [b'(' | b')'] = intermediates {
+            let slot = usize::from(intermediates[0] == b')');
+            self.screen.charsets[slot] = if byte == b'0' {
+                Charset::DecSpecialGraphics
+            } else {
+                Charset::Ascii
+            };
+            return;
+        }
+        // Other sequences with intermediates (like ESC # 8 for DECALN)
         if !intermediates.is_empty() {
             trace!("ESC with intermediates {:?} byte {}", intermediates, byte);
             return;
@@ -468,22 +468,19 @@ impl<'a> Perform for ScreenPerformer<'a> {
         match byte {
             // DECSC - Save cursor position
             b'7' => {
-                self.screen.saved_cursor = Some(self.screen.cursor);
+                self.screen.decsc_cursor = Some(self.screen.cursor);
             }
             // DECRC - Restore cursor position
             b'8' => {
-                if let Some(saved) = self.screen.saved_cursor {
-                    self.screen.cursor = saved;
+                if let Some((sx, sy)) = self.screen.decsc_cursor {
+                    self.screen.set_cursor(sx, sy);
+                    self.cursor_moved();
                 }
             }
             // RI - Reverse Index (move cursor up, scroll down if at top)
             b'M' => {
-                let (top, _) = self
-                    .screen
-                    .scroll_region
-                    .unwrap_or((0, self.screen.size.1 - 1));
-                if self.screen.cursor.1 == top {
-                    // At top of scroll region - scroll down
+                self.screen.pending_wrap = false;
+                if self.screen.cursor.1 == self.region_top() {
                     self.screen.scroll_down(1);
                 } else if self.screen.cursor.1 > 0 {
                     self.screen.cursor.1 -= 1;
@@ -491,29 +488,21 @@ impl<'a> Perform for ScreenPerformer<'a> {
             }
             // IND - Index (move cursor down, scroll up if at bottom)
             b'D' => {
-                let (_, bottom) = self
-                    .screen
-                    .scroll_region
-                    .unwrap_or((0, self.screen.size.1 - 1));
-                if self.screen.cursor.1 == bottom {
-                    // At bottom of scroll region - scroll up
-                    self.screen.scroll_up(1);
-                } else if self.screen.cursor.1 < self.screen.size.1 - 1 {
-                    self.screen.cursor.1 += 1;
-                }
+                self.screen.pending_wrap = false;
+                self.linefeed();
             }
             // NEL - Next Line (CR + LF)
             b'E' => {
+                self.speech_line_break();
+                self.screen.pending_wrap = false;
                 self.screen.cursor.0 = 0;
-                let (_, bottom) = self
-                    .screen
-                    .scroll_region
-                    .unwrap_or((0, self.screen.size.1 - 1));
-                if self.screen.cursor.1 == bottom {
-                    self.screen.scroll_up(1);
-                } else if self.screen.cursor.1 < self.screen.size.1 - 1 {
-                    self.screen.cursor.1 += 1;
-                }
+                self.linefeed();
+                self.continue_at_cursor();
+            }
+            // RIS - full reset
+            b'c' => {
+                self.screen.reset();
+                self.speech_buffer.begin_row();
             }
             _ => {
                 trace!("Unhandled ESC: 0x{:02x} ('{}')", byte, byte as char);
@@ -545,6 +534,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
             performer.print('H');
             performer.print('i');
@@ -566,6 +557,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
 
             for c in "ABCDE".chars() {
@@ -573,9 +566,10 @@ mod tests {
             }
         }
 
-        // Cursor should be at position 5 (one past the last column)
+        // Cursor stays in the last column with a wrap pending,
         // which will trigger wrap on next character
-        assert_eq!(screen.cursor.0, 5);
+        assert_eq!(screen.cursor.0, 4);
+        assert!(screen.pending_wrap);
         assert_eq!(screen.cursor.1, 0);
 
         // Print one more character - should wrap to next line
@@ -585,6 +579,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
             performer.print('F');
         }
@@ -611,6 +607,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
 
             for c in "ABCDEFGHIJKLMNO".chars() {
@@ -618,8 +616,9 @@ mod tests {
             }
         }
 
-        // Now cursor is at (5, 2) - past right edge of bottom line
-        assert_eq!(screen.cursor.0, 5);
+        // Now cursor is at (4, 2) - last column of bottom line, wrap pending
+        assert_eq!(screen.cursor.0, 4);
+        assert!(screen.pending_wrap);
         assert_eq!(screen.cursor.1, 2);
 
         // Print one more character - should wrap and scroll
@@ -629,6 +628,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
             performer.print('P');
         }
@@ -657,6 +658,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
             performer.execute(b'\n');
         }
@@ -681,6 +684,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
             performer.execute(b'\n');
         }
@@ -708,6 +713,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
             performer.execute(b'\r');
         }
@@ -727,6 +734,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
             performer.execute(b'\r');
             performer.execute(b'\n');
@@ -746,6 +755,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
 
             // Simulate output that fills and overflows the screen
@@ -777,6 +788,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: true, // Enable line pause
+                echo_key: &mut None,
+                echoed: None,
             };
 
             // Print some text, then a newline
@@ -810,6 +823,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false, // Disable line pause
+                echo_key: &mut None,
+                echoed: None,
             };
 
             // Print some text, then a newline
@@ -845,6 +860,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
 
             // ESC 7 - Save cursor
@@ -860,6 +877,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
 
             // ESC 8 - Restore cursor
@@ -888,6 +907,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
             performer.esc_dispatch(&[], false, b'M');
         }
@@ -903,6 +924,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
             // ESC M at top should scroll down
             performer.esc_dispatch(&[], false, b'M');
@@ -932,6 +955,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
             performer.esc_dispatch(&[], false, b'D');
         }
@@ -947,6 +972,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
             // ESC D at bottom should scroll up
             performer.esc_dispatch(&[], false, b'D');
@@ -972,6 +999,8 @@ mod tests {
                 speech_buffer: &mut speech_buffer,
                 last_drawn: &mut last_drawn,
                 line_pause: false,
+                echo_key: &mut None,
+                echoed: None,
             };
             // ESC E - Next Line (CR + LF)
             performer.esc_dispatch(&[], false, b'E');
@@ -979,5 +1008,209 @@ mod tests {
 
         // Should be at start of next line
         assert_eq!(screen.cursor, (0, 3));
+    }
+
+    // ========== Speech separation / overwrite / wrap tests ==========
+
+    /// Feed a byte string through a real vte parser into a fresh performer.
+    fn run_bytes(cols: u16, rows: u16, line_pause: bool, bytes: &[u8]) -> (Screen, SpeechBuffer) {
+        let mut screen = Screen::new(cols, rows);
+        let mut speech_buffer = SpeechBuffer::new();
+        let mut last_drawn = (0, 0);
+        let mut parser = vte::Parser::new();
+        {
+            let mut performer = ScreenPerformer {
+                screen: &mut screen,
+                speech_buffer: &mut speech_buffer,
+                last_drawn: &mut last_drawn,
+                line_pause,
+                echo_key: &mut None,
+                echoed: None,
+            };
+            for &b in bytes {
+                parser.advance(&mut performer, b);
+            }
+        }
+        (screen, speech_buffer)
+    }
+
+    /// Like `run_bytes` but with a typed key pending; returns the echoed char too.
+    fn run_bytes_echo(bytes: &[u8], key: char) -> (SpeechBuffer, Option<char>) {
+        let mut screen = Screen::new(20, 5);
+        let mut speech_buffer = SpeechBuffer::new();
+        let mut last_drawn = (0, 0);
+        let mut echo_key = Some(key);
+        let mut parser = vte::Parser::new();
+        let echoed = {
+            let mut performer = ScreenPerformer {
+                screen: &mut screen,
+                speech_buffer: &mut speech_buffer,
+                last_drawn: &mut last_drawn,
+                line_pause: false,
+                echo_key: &mut echo_key,
+                echoed: None,
+            };
+            for &b in bytes {
+                parser.advance(&mut performer, b);
+            }
+            performer.echoed
+        };
+        (speech_buffer, echoed)
+    }
+
+    #[test]
+    fn test_key_echo_is_matched_at_draw_time() {
+        // Plain echo
+        let (sb, echoed) = run_bytes_echo(b"a", 'a');
+        assert_eq!(echoed, Some('a'));
+        assert_eq!(sb.contents(), "");
+        // zsh-style echo wrapped in SGR: still recognised, rest still spoken
+        let (sb, echoed) = run_bytes_echo(b"\x1b[32ma\x1b[0m", 'a');
+        assert_eq!(echoed, Some('a'));
+        assert_eq!(sb.contents(), "");
+        // First drawn char differs: no echo, key forgotten, text spoken
+        let (sb, echoed) = run_bytes_echo(b"xa", 'a');
+        assert_eq!(echoed, None);
+        assert_eq!(sb.contents(), "xa");
+    }
+
+    #[test]
+    fn test_dec_special_graphics_charset() {
+        let (screen, sb) = run_bytes(20, 2, false, b"\x1b(0lqqk\x1b(Bok");
+        assert_eq!(screen.get_line_trimmed(0), "┌──┐ok");
+        assert_eq!(sb.contents(), "┌──┐ok");
+        // G1 via SO/SI
+        let (screen, _) = run_bytes(20, 2, false, b"\x1b)0a\x0eq\x0fq");
+        assert_eq!(screen.get_line_trimmed(0), "a─q");
+        // RIS resets charsets
+        let (screen, _) = run_bytes(20, 2, false, b"\x1b(0\x1bcq");
+        assert_eq!(screen.get_line_trimmed(0), "q");
+    }
+
+    #[test]
+    fn test_ed3_does_not_clear_screen() {
+        let (screen, _) = run_bytes(10, 2, false, b"keep\x1b[3J");
+        assert_eq!(screen.get_line_trimmed(0), "keep");
+    }
+
+    #[test]
+    fn test_cup_to_other_row_separates_speech() {
+        // Full-screen apps paint rows with CUP and no newline
+        let (_, sb) = run_bytes(20, 5, false, b"\x1b[1;1Hfoo\x1b[2;1Hbar");
+        assert_eq!(sb.contents(), "foo bar");
+        let (_, mut sb) = run_bytes(20, 5, true, b"\x1b[1;1Hfoo\x1b[2;1Hbar");
+        assert_eq!(sb.drain_lines(), vec!["foo".to_string()]);
+        assert_eq!(sb.contents(), "bar");
+    }
+
+    #[test]
+    fn test_crlf_keeps_text_and_adds_single_space() {
+        let (_, sb) = run_bytes(20, 5, false, b"Hi\r\nBye");
+        assert_eq!(sb.contents(), "Hi Bye");
+        let (_, sb) = run_bytes(20, 5, false, b"Hi\nBye");
+        assert_eq!(sb.contents(), "Hi Bye");
+    }
+
+    #[test]
+    fn test_carriage_return_rewrite_replaces_row_speech() {
+        // A progress bar redrawn in place is spoken once, not once per redraw
+        let (screen, sb) = run_bytes(20, 5, false, b"10%\r20%\r30%");
+        assert_eq!(sb.contents(), "30%");
+        assert_eq!(screen.get_line_trimmed(0), "30%");
+        // ...and a previous, completed row is untouched
+        let (_, sb) = run_bytes(20, 5, false, b"done\r\n10%\r20%");
+        assert_eq!(sb.contents(), "done 20%");
+        // CHA back to column 1 on the same row is a rewrite too
+        let (_, sb) = run_bytes(20, 5, false, b"10%\x1b[1G20%");
+        assert_eq!(sb.contents(), "20%");
+    }
+
+    #[test]
+    fn test_wide_chars_do_not_get_spaces_between_them() {
+        let (screen, sb) = run_bytes(10, 2, false, "日本語".as_bytes());
+        assert_eq!(sb.contents(), "日本語");
+        assert_eq!(screen.cursor, (6, 0));
+        assert!(screen.buffer[0][1].is_wide_continuation);
+        assert_eq!(screen.get_line_trimmed(0), "日本語");
+    }
+
+    #[test]
+    fn test_wide_char_in_last_column_wraps_first() {
+        let (screen, _) = run_bytes(5, 2, false, "abcd日".as_bytes());
+        assert_eq!(screen.get_line_trimmed(0), "abcd");
+        assert_eq!(screen.get_char(0, 1), Some('日'));
+    }
+
+    #[test]
+    fn test_zero_width_chars_go_to_speech_only() {
+        // e + combining acute, then heart + VS16
+        let (screen, sb) = run_bytes(10, 1, false, "e\u{301}x".as_bytes());
+        assert_eq!(sb.contents(), "e\u{301}x");
+        assert_eq!(screen.get_char(0, 0), Some('e'));
+        assert_eq!(screen.get_char(1, 0), Some('x'));
+    }
+
+    #[test]
+    fn test_wrapped_word_is_not_split_in_speech() {
+        let (screen, sb) = run_bytes(5, 3, false, b"abcdefgh");
+        assert_eq!(sb.contents(), "abcdefgh");
+        assert_eq!(screen.get_line_trimmed(0), "abcde");
+        assert_eq!(screen.get_line_trimmed(1), "fgh");
+    }
+
+    #[test]
+    fn test_backspace_after_full_line_lands_before_last_column() {
+        let (screen, _) = run_bytes(5, 2, false, b"abcde\x08X");
+        // Real terminals: cursor shown on 'e' (wrap pending), BS moves to 'd'
+        assert_eq!(screen.get_line_trimmed(0), "abcXe");
+    }
+
+    #[test]
+    fn test_sgr_does_not_cancel_pending_wrap() {
+        let (screen, _) = run_bytes(5, 2, false, b"abcde\x1b[0mF");
+        assert_eq!(screen.get_char(0, 1), Some('F'));
+    }
+
+    #[test]
+    fn test_ech_erases_in_place() {
+        let (screen, _) = run_bytes(10, 1, false, b"abcdef\x1b[2G\x1b[3X");
+        assert_eq!(screen.get_line_trimmed(0), "a   ef");
+    }
+
+    #[test]
+    fn test_csi_param_zero_means_one() {
+        let (screen, _) = run_bytes(10, 5, false, b"\x1b[3;3H\x1b[0A\x1b[0D");
+        assert_eq!(screen.cursor, (1, 1));
+        let (screen, _) = run_bytes(10, 5, false, b"\x1b[3;3H\x1b[0;0H");
+        assert_eq!(screen.cursor, (0, 0));
+    }
+
+    #[test]
+    fn test_cnl_cpl_hpa() {
+        let (screen, _) = run_bytes(10, 5, false, b"\x1b[2;5H\x1b[2E");
+        assert_eq!(screen.cursor, (0, 3));
+        let (screen, _) = run_bytes(10, 5, false, b"\x1b[4;5H\x1b[F");
+        assert_eq!(screen.cursor, (0, 2));
+        let (screen, _) = run_bytes(10, 5, false, b"\x1b[7`");
+        assert_eq!(screen.cursor, (6, 0));
+    }
+
+    #[test]
+    fn test_decsc_inside_alt_screen_does_not_clobber_main_cursor() {
+        let bytes = b"\x1b[2;3Hshell\x1b[?1049h\x1b[5;5H\x1b7\x1b[1;1H\x1b8x\x1b[?1049l";
+        let (screen, _) = run_bytes(20, 6, false, bytes);
+        // Back on the main screen at the cursor saved by 1049h
+        assert_eq!(screen.get_line_trimmed(1), "  shell");
+        assert_eq!(screen.cursor, (7, 1));
+        assert!(!screen.in_alt_screen);
+    }
+
+    #[test]
+    fn test_ris_resets_everything() {
+        let (screen, _) = run_bytes(10, 5, false, b"abc\x1b[2;4r\x1b[?1049h\x1bc");
+        assert_eq!(screen.cursor, (0, 0));
+        assert_eq!(screen.scroll_region, None);
+        assert!(!screen.in_alt_screen);
+        assert_eq!(screen.get_line_trimmed(0), "");
     }
 }

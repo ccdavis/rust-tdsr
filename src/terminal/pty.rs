@@ -6,8 +6,8 @@
 
 use crate::{Result, TdsrError};
 use log::{debug, info};
+use nix::fcntl::{fcntl, FcntlArg};
 use nix::libc;
-use nix::unistd::dup;
 use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -25,7 +25,7 @@ pub struct Pty {
     writer: Box<dyn Write + Send>,
 
     /// The child process (shell) running in the PTY
-    _child: Box<dyn Child + Send>,
+    child: Box<dyn Child + Send>,
 
     /// Duplicated file descriptor for the PTY (for event loop registration)
     /// This is our own copy that stays valid even after master is consumed
@@ -43,7 +43,17 @@ impl Pty {
     ///
     /// This sets up the terminal environment that the screen reader monitors.
     /// If no program is specified, spawns the user's default shell.
-    pub fn new(program: Option<Vec<String>>, rows: u16, cols: u16) -> Result<Self> {
+    ///
+    /// `termios` is the user's terminal settings as they were before TDSR
+    /// switched to raw mode; they are applied to the new PTY so the shell
+    /// sees the same erase character, flow-control and other settings it
+    /// would have had without a screen reader in between.
+    pub fn new(
+        program: Option<Vec<String>>,
+        rows: u16,
+        cols: u16,
+        termios: Option<&libc::termios>,
+    ) -> Result<Self> {
         let pty_system = native_pty_system();
 
         let size = PtySize {
@@ -60,12 +70,24 @@ impl Pty {
             .openpty(size)
             .map_err(|e| TdsrError::Pty(format!("Failed to open PTY: {}", e)))?;
 
+        // Copy the user's terminal attributes onto the new PTY before the
+        // shell starts. termios ioctls on the master apply to the PTY itself.
+        if let (Some(t), Some(master_fd)) = (termios, pair.master.as_raw_fd()) {
+            // Safety: TCSADRAIN with a termios struct obtained from tcgetattr.
+            if unsafe { libc::tcsetattr(master_fd, libc::TCSADRAIN, t) } != 0 {
+                debug!(
+                    "Could not apply terminal attributes to PTY: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+
         // Determine what program to run
-        let cmd = if let Some(prog) = program {
+        let cmd = if let Some((first, rest)) = program.as_deref().and_then(|p| p.split_first()) {
             // User specified a program
-            info!("Spawning specified program: {:?}", prog);
-            let mut cmd = CommandBuilder::new(&prog[0]);
-            for arg in &prog[1..] {
+            info!("Spawning specified program: {} {:?}", first, rest);
+            let mut cmd = CommandBuilder::new(first);
+            for arg in rest {
                 cmd.arg(arg);
             }
             cmd
@@ -91,8 +113,9 @@ impl Pty {
         debug!("Original PTY file descriptor: {}", original_fd);
 
         // Duplicate the file descriptor so we have our own copy that won't be closed
-        // when the master is consumed by take_writer()
-        let dup_fd = dup(original_fd)
+        // when the master is consumed by take_writer(). Close-on-exec so that
+        // subprocesses we spawn later (plugins) don't inherit the PTY master.
+        let dup_fd = fcntl(original_fd, FcntlArg::F_DUPFD_CLOEXEC(0))
             .map_err(|e| TdsrError::Pty(format!("Failed to duplicate fd: {}", e)))?;
 
         debug!("Duplicated PTY file descriptor: {}", dup_fd);
@@ -118,7 +141,7 @@ impl Pty {
         Ok(Self {
             reader,
             writer,
-            _child: child,
+            child,
             _fd_owner: fd_owner,
             fd,
             _size: size,
@@ -151,6 +174,41 @@ impl Pty {
     /// Flush writer
     pub fn flush(&mut self) -> Result<()> {
         self.writer.flush().map_err(TdsrError::Io)
+    }
+
+    /// Whether more output is ready to read right now (non-blocking).
+    pub fn has_more(&self) -> bool {
+        use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+        use std::os::unix::io::BorrowedFd;
+        // Safety: the fd is owned by `_fd_owner` for the life of `self`.
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::ZERO) {
+            Ok(n) if n > 0 => fds[0]
+                .revents()
+                .is_some_and(|r| r.intersects(PollFlags::POLLIN | PollFlags::POLLHUP)),
+            _ => false,
+        }
+    }
+
+    /// Check whether the child has exited without blocking.
+    ///
+    /// Returns its exit code if it has. The event loop polls this so TDSR
+    /// still exits when the shell is gone but a background job keeps the
+    /// PTY open.
+    pub fn try_wait(&mut self) -> Result<Option<u32>> {
+        self.child
+            .try_wait()
+            .map(|status| status.map(|s| s.exit_code()))
+            .map_err(TdsrError::Io)
+    }
+
+    /// Wait for the child to exit and return its exit code.
+    pub fn wait(&mut self) -> Result<u32> {
+        self.child
+            .wait()
+            .map(|s| s.exit_code())
+            .map_err(TdsrError::Io)
     }
 
     /// Resize the terminal

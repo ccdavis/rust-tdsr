@@ -3,7 +3,7 @@
 //! Processes Alt+key combinations for screen reader navigation commands
 //! and passes unrecognized keys through to the shell.
 
-use super::{HandlerAction, KeyAction, KeyHandler};
+use super::{HandlerAction, KeyAction};
 use crate::state::State;
 use crate::terminal::Emulator;
 use crate::Result;
@@ -140,13 +140,9 @@ impl DefaultKeyHandler {
             QuietMode => {
                 let quiet = state.toggle_quiet();
                 debug!("Quiet mode: {}", quiet);
-                if quiet {
-                    // Bypass state.speak() since quiet is already true and
-                    // speak() would suppress this confirmation
-                    state.synth.speak("quiet on")?;
-                } else {
-                    state.speak("quiet off")?;
-                }
+                // Quiet only suppresses automatic terminal output; explicit
+                // commands (including this announcement) still speak.
+                state.speak(if quiet { "quiet on" } else { "quiet off" })?;
                 Ok(HandlerAction::Handled)
             }
 
@@ -364,14 +360,5 @@ impl DefaultKeyHandler {
                 Ok(HandlerAction::Passthrough)
             }
         }
-    }
-}
-
-impl KeyHandler for DefaultKeyHandler {
-    fn process(&mut self, _key: &[u8]) -> Result<HandlerAction> {
-        // This shouldn't be called directly - use process_key instead
-        // which needs state and emulator access
-        trace!("DefaultKeyHandler::process called (passthrough)");
-        Ok(HandlerAction::Passthrough)
     }
 }

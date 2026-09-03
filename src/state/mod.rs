@@ -13,8 +13,9 @@ use crate::speech::{SpeechBuffer, Synth};
 use crate::terminal::Screen;
 use crate::Result;
 use config::Config;
-use log::info;
+use log::{info, warn};
 use phonetics::PHONETICS;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
@@ -90,13 +91,24 @@ pub struct State {
     /// Delayed functions for cursor tracking
     /// Functions scheduled to run after a delay (e.g., speak character after arrow key)
     delayed_functions: Vec<DelayedFunction>,
+
+    /// Results from plugins running on worker threads; drained by
+    /// `poll_plugin_results` from the event loop.
+    plugin_results: Receiver<Result<Vec<String>>>,
+    plugin_sender: Sender<Result<Vec<String>>>,
+
+    /// Number of plugins currently running
+    plugins_running: usize,
 }
 
 impl State {
     /// Create a new application state with given terminal dimensions
     ///
     /// Loads configuration from disk and initializes all screen reader state.
-    pub fn new(cols: u16, rows: u16) -> Result<Self> {
+    ///
+    /// `speech_command` overrides the config's `speech_command` (from the
+    /// `--speech-command` command-line option).
+    pub fn new(cols: u16, rows: u16, speech_command: Option<String>) -> Result<Self> {
         info!("Initializing state with {}x{} terminal", cols, rows);
 
         let config = Config::load()?;
@@ -108,9 +120,23 @@ impl State {
         info!("  Cursor tracking: {}", config.cursor_tracking());
 
         // Create speech synthesizer
-        let mut synth = crate::speech::create_synth()?;
+        let speech_command = speech_command.or_else(|| config.speech_command());
+        let synth = crate::speech::create_synth(speech_command.as_deref())?;
         info!("Speech synthesizer created");
 
+        Self::from_parts(config, synth, cols, rows)
+    }
+
+    /// Build state from an already-loaded config and synthesizer.
+    ///
+    /// `new()` uses this with the platform synth; tests use it with a mock
+    /// synth and a config loaded from a temporary path.
+    pub fn from_parts(
+        config: Config,
+        mut synth: Box<dyn Synth>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Self> {
         // Apply config settings to synth
         if let Some(rate) = config.rate() {
             synth.set_rate(rate)?;
@@ -157,6 +183,7 @@ impl State {
             None
         };
 
+        let (tx, rx) = mpsc::channel();
         Ok(Self {
             config,
             review: ReviewCursor::new(cols, rows),
@@ -173,6 +200,9 @@ impl State {
             last_key: None,
             plugin_manager,
             delayed_functions: Vec::new(),
+            plugin_results: rx,
+            plugin_sender: tx,
+            plugins_running: 0,
         })
     }
 
@@ -194,7 +224,8 @@ impl State {
 
     /// Toggle quiet mode
     ///
-    /// When quiet, screen reader only speaks on explicit navigation commands
+    /// When quiet, terminal output is not read automatically; explicit
+    /// navigation commands and announcements still speak.
     pub fn toggle_quiet(&mut self) -> bool {
         self.quiet = !self.quiet;
         self.quiet
@@ -222,7 +253,7 @@ impl State {
             let (end_x, end_y) = self.review.pos;
 
             // Copy text from selection
-            let text = self.copy_text_range(screen, start_x, start_y, end_x, end_y);
+            let text = screen.text_range((start_x, start_y), (end_x, end_y));
 
             // Copy to clipboard
             crate::clipboard::copy_to_clipboard(&text)?;
@@ -233,58 +264,6 @@ impl State {
             self.speak("copied")?;
         }
         Ok(())
-    }
-
-    /// Copy text from a linear region of the screen
-    ///
-    /// Performs a linear (stream) selection from start to end position,
-    /// like selecting text in a word processor. Multi-line selections
-    /// include the end of the first line, full middle lines, and the
-    /// beginning of the last line.
-    fn copy_text_range(
-        &self,
-        screen: &Screen,
-        mut start_x: u16,
-        mut start_y: u16,
-        mut end_x: u16,
-        mut end_y: u16,
-    ) -> String {
-        // Normalize so start is before end in reading order (row-major)
-        // Important: swap both x and y together to maintain the linear selection
-        if start_y > end_y || (start_y == end_y && start_x > end_x) {
-            std::mem::swap(&mut start_x, &mut end_x);
-            std::mem::swap(&mut start_y, &mut end_y);
-        }
-
-        let mut text = String::new();
-        let (cols, _) = screen.size;
-
-        for y in start_y..=end_y {
-            // On first row: start from start_x
-            // On subsequent rows: start from column 0
-            let line_start = if y == start_y { start_x } else { 0 };
-
-            // On last row: end at end_x
-            // On earlier rows: end at last column
-            let line_end = if y == end_y { end_x } else { cols - 1 };
-
-            // Get characters from this line
-            for x in line_start..=line_end {
-                if let Some(ch) = screen.get_char(x, y) {
-                    // Skip wide character continuation cells
-                    if ch != '\0' {
-                        text.push(ch);
-                    }
-                }
-            }
-
-            // Add newline except for last line
-            if y < end_y {
-                text.push('\n');
-            }
-        }
-
-        text
     }
 
     /// End text selection without copying
@@ -301,12 +280,73 @@ impl State {
     ///
     /// Central method for all screen reader speech output
     /// Processes symbols if enabled (e.g., "!" becomes "bang")
+    ///
+    /// Quiet mode is deliberately *not* checked here: it only suppresses
+    /// automatic reading of terminal output (see `handle_pty_output`), while
+    /// explicit review commands and announcements must always be heard.
+    ///
+    /// Speech backend failures are logged, not returned: a synth that has
+    /// died must never take the screen reader session down with it.
     pub fn speak(&mut self, text: &str) -> Result<()> {
-        if !self.quiet {
-            let processed = self.process_symbols_in_text(text);
-            self.synth.speak(&processed)?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(());
+        }
+        let processed = self.process_symbols_in_text(text);
+        self.synth_op("speak", |s| s.speak(&processed))
+    }
+
+    /// Speak automatically-read terminal output: like `speak`, but with
+    /// repeated-symbol condensing applied when that option is on.
+    pub fn speak_output(&mut self, text: &str) -> Result<()> {
+        let condensed = self.replace_duplicate_characters(text);
+        self.speak(&condensed)
+    }
+
+    /// Run a synth command, turning failures into a log line.
+    fn synth_op(
+        &mut self,
+        what: &str,
+        op: impl FnOnce(&mut dyn Synth) -> Result<()>,
+    ) -> Result<()> {
+        if let Err(e) = op(self.synth.as_mut()) {
+            warn!("Speech {} failed: {}", what, e);
         }
         Ok(())
+    }
+
+    /// Flush the speech buffer to the synthesizer (pending lines first).
+    /// Called from the scheduled flush after terminal output settles.
+    pub fn flush_speech(&mut self) -> Result<()> {
+        for line in self.speech_buffer.drain_lines() {
+            self.speak_output(&line)?;
+        }
+        if !self.speech_buffer.is_empty() {
+            let text = self.speech_buffer.flush();
+            self.speak_output(&text)?;
+        }
+        Ok(())
+    }
+
+    /// Speak the buffered output shortly, once no more output arrives.
+    ///
+    /// Output often comes in several writes a few milliseconds apart (a
+    /// prompt, then a command's echo, then its output). Deferring the flush
+    /// by a few milliseconds turns those into one utterance instead of a
+    /// stutter of fragments, as the original TDSR did.
+    pub fn schedule_speech_flush(&mut self) {
+        if self.delaying_output {
+            return;
+        }
+        self.delaying_output = true;
+        self.schedule(
+            Duration::from_millis(5),
+            |state, _screen| {
+                state.delaying_output = false;
+                state.flush_speech()
+            },
+            false,
+        );
     }
 
     /// Speak a single character (for key echo)
@@ -314,18 +354,12 @@ impl State {
     /// Uses the TTS "letter" mode if available, or falls back to
     /// speaking the character's name for special characters.
     pub fn speak_char(&mut self, ch: char) -> Result<()> {
-        if self.quiet {
-            return Ok(());
-        }
-
         // For special characters, use their symbol name
-        if let Some(name) = self.config.symbols.get(&(ch as u32)) {
-            self.synth.letter(name)?;
-        } else {
-            // Use letter mode for regular characters
-            self.synth.letter(&ch.to_string())?;
-        }
-        Ok(())
+        let text = match self.config.symbols.get(&(ch as u32)) {
+            Some(name) => name.clone(),
+            None => ch.to_string(),
+        };
+        self.synth_op("letter", |s| s.letter(&text))
     }
 
     /// Process symbols in text if enabled
@@ -365,7 +399,7 @@ impl State {
 
     /// Cancel any pending speech
     pub fn cancel_speech(&mut self) -> Result<()> {
-        self.synth.cancel()
+        self.synth_op("cancel", |s| s.cancel())
     }
 
     // ========== Review Cursor Navigation ==========
@@ -481,7 +515,8 @@ impl State {
         }
 
         // Use letter speech command for single characters
-        self.synth.letter(&ch.to_string())
+        let text = ch.to_string();
+        self.synth_op("letter", |s| s.letter(&text))
     }
 
     /// Move to previous character and speak it
@@ -556,10 +591,18 @@ impl State {
         if word.is_empty() {
             self.speak("space")?;
         } else if spell {
-            // Spell the word letter by letter
-            for ch in word.chars() {
-                self.synth.letter(&ch.to_string())?;
-            }
+            // Spell the word as one utterance ("h e l l o"), naming symbols
+            // even when symbol processing is off. One utterance is much
+            // smoother than a separate letter command per character.
+            let spelled = word
+                .chars()
+                .map(|ch| match self.config.symbols.get(&(ch as u32)) {
+                    Some(name) => name.clone(),
+                    None => ch.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.synth_op("speak", |s| s.speak(&spelled))?;
         } else {
             self.speak(&word)?;
         }
@@ -648,21 +691,41 @@ impl State {
 
     /// Execute a plugin by keyboard shortcut
     ///
-    /// Runs the plugin script, collects output, and speaks it to the user
+    /// Starts the plugin on a worker thread; its output is spoken when
+    /// `poll_plugin_results` picks it up, so keys and terminal output keep
+    /// flowing while it runs.
     pub fn execute_plugin(&mut self, key: &str, screen: &Screen) -> Result<()> {
-        if let Some(ref pm) = self.plugin_manager {
-            match pm.execute_plugin(key, screen, &self.last_command) {
+        let Some(pm) = self.plugin_manager.as_ref() else {
+            return Ok(());
+        };
+        match pm.execute_plugin_async(key, screen, &self.last_command, self.plugin_sender.clone()) {
+            Ok(true) => self.plugins_running += 1,
+            Ok(false) => {}
+            Err(e) => self.speak(&format!("Plugin error: {}", e))?,
+        }
+        Ok(())
+    }
+
+    /// Speak any plugin results that have arrived. Called from the event
+    /// loop on every iteration (it wakes at least every 100 ms).
+    pub fn poll_plugin_results(&mut self) -> Result<()> {
+        while let Ok(result) = self.plugin_results.try_recv() {
+            self.plugins_running = self.plugins_running.saturating_sub(1);
+            match result {
                 Ok(lines) => {
                     for line in lines {
                         self.speak(&line)?;
                     }
                 }
-                Err(e) => {
-                    self.speak(&format!("Plugin error: {}", e))?;
-                }
+                Err(e) => self.speak(&format!("Plugin error: {}", e))?,
             }
         }
         Ok(())
+    }
+
+    /// Whether any plugin is still running on a worker thread
+    pub fn plugins_running(&self) -> bool {
+        self.plugins_running > 0
     }
 
     /// Check if a key has a plugin bound to it
@@ -695,6 +758,11 @@ impl State {
     pub fn clear_delayed_functions(&mut self) {
         self.delayed_functions.clear();
         self.temp_silence = false;
+        // A keypress silences speech; drop output that was waiting to be
+        // spoken as well, rather than reading it out stale later.
+        self.delaying_output = false;
+        self.speech_buffer.drain_lines();
+        self.speech_buffer.flush();
     }
 
     /// Run any delayed functions that are ready
@@ -775,123 +843,5 @@ impl State {
         };
 
         self.review.pos = (x, new_y);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::terminal::Screen;
-
-    /// Test helper to create a screen with test content
-    fn create_test_screen() -> Screen {
-        let mut screen = Screen::new(10, 5);
-        // Fill with recognizable content:
-        // Row 0: "AAAAAAAAAA"
-        // Row 1: "BBBBBBBBBB"
-        // Row 2: "CCCCCCCCCC"
-        // Row 3: "DDDDDDDDDD"
-        // Row 4: "EEEEEEEEEE"
-        for y in 0..5 {
-            let ch = (b'A' + y as u8) as char;
-            for x in 0..10 {
-                screen.buffer[y][x].data = ch;
-            }
-        }
-        screen
-    }
-
-    /// Test helper to extract text from screen using the same logic as copy_text_range
-    fn extract_text(screen: &Screen, start_x: u16, start_y: u16, end_x: u16, end_y: u16) -> String {
-        let mut start_x = start_x;
-        let mut start_y = start_y;
-        let mut end_x = end_x;
-        let mut end_y = end_y;
-
-        // Same normalization logic as copy_text_range
-        if start_y > end_y || (start_y == end_y && start_x > end_x) {
-            std::mem::swap(&mut start_x, &mut end_x);
-            std::mem::swap(&mut start_y, &mut end_y);
-        }
-
-        let mut text = String::new();
-        let (cols, _) = screen.size;
-
-        for y in start_y..=end_y {
-            let line_start = if y == start_y { start_x } else { 0 };
-            let line_end = if y == end_y { end_x } else { cols - 1 };
-
-            for x in line_start..=line_end {
-                if let Some(ch) = screen.get_char(x, y) {
-                    if ch != '\0' {
-                        text.push(ch);
-                    }
-                }
-            }
-
-            if y < end_y {
-                text.push('\n');
-            }
-        }
-
-        text
-    }
-
-    #[test]
-    fn test_linear_selection_single_line() {
-        let screen = create_test_screen();
-
-        // Select part of row 1: columns 2-5
-        let text = extract_text(&screen, 2, 1, 5, 1);
-        assert_eq!(text, "BBBB");
-    }
-
-    #[test]
-    fn test_linear_selection_multi_line() {
-        let screen = create_test_screen();
-
-        // Select from row 1, col 5 to row 2, col 3
-        // Should get: "BBBBB" (5-9 of row 1) + "\n" + "CCCC" (0-3 of row 2)
-        let text = extract_text(&screen, 5, 1, 3, 2);
-        assert_eq!(text, "BBBBB\nCCCC");
-    }
-
-    #[test]
-    fn test_linear_selection_backwards() {
-        let screen = create_test_screen();
-
-        // Select backwards: from row 2, col 3 to row 1, col 5
-        // Should give same result as forward selection
-        let text = extract_text(&screen, 3, 2, 5, 1);
-        assert_eq!(text, "BBBBB\nCCCC");
-    }
-
-    #[test]
-    fn test_linear_selection_full_lines() {
-        let screen = create_test_screen();
-
-        // Select from row 1, col 0 to row 2, col 9 (full two lines)
-        let text = extract_text(&screen, 0, 1, 9, 2);
-        assert_eq!(text, "BBBBBBBBBB\nCCCCCCCCCC");
-    }
-
-    #[test]
-    fn test_linear_selection_three_lines() {
-        let screen = create_test_screen();
-
-        // Select from row 1, col 7 to row 3, col 2
-        // Row 1: cols 7-9 = "BBB"
-        // Row 2: full line = "CCCCCCCCCC"
-        // Row 3: cols 0-2 = "DDD"
-        let text = extract_text(&screen, 7, 1, 2, 3);
-        assert_eq!(text, "BBB\nCCCCCCCCCC\nDDD");
-    }
-
-    #[test]
-    fn test_linear_selection_single_char() {
-        let screen = create_test_screen();
-
-        // Select single character
-        let text = extract_text(&screen, 5, 2, 5, 2);
-        assert_eq!(text, "C");
     }
 }

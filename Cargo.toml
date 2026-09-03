@@ -59,23 +59,31 @@ once_cell = "1.19"
 # Directory utilities
 dirs = "5.0"
 
-# Text-to-speech via the `tts` crate (Speech Dispatcher on Linux, AVFoundation
-# fallback on macOS). Optional: enabling it requires libspeechd-dev >= 0.10 at
-# build time. Disable with --no-default-features on older distros (e.g. Ubuntu
-# 20.04, which ships speech-dispatcher 0.9.1) to build an espeak-ng-only binary.
+# Platform-specific dependencies
+
+# Text-to-speech via the `tts` crate (Speech Dispatcher on Linux and other
+# Unixes). Optional: enabling it requires libspeechd-dev >= 0.10 at build time.
+# Disable with --no-default-features on older distros (e.g. Ubuntu 20.04, which
+# ships speech-dispatcher 0.9.1) to build an espeak-ng-only binary.
+#
+# Not used on macOS: the in-process AVFoundation path only plays the first
+# utterance because the main thread never services a CFRunLoop. macOS uses the
+# speech-server subprocess in speech/backends/avfoundation.rs exclusively.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
 tts = { version = "0.26", optional = true }
 
-# Platform-specific dependencies
-[target.'cfg(target_os = "linux")'.dependencies]
-# Speech Dispatcher for Linux TTS (now using native bindings via tts crate)
-
 [target.'cfg(target_os = "macos")'.dependencies]
-# Dedicated AVFoundation speech backend (see speech/backends/avfoundation.rs):
-# AVSpeechSynthesizer needs a serviced CFRunLoop, so we drive it directly on a
-# dedicated thread instead of through the tts crate on the main thread.
+# AVFoundation speech server (see speech/backends/avfoundation.rs): the binary
+# re-execs itself as `tdsr --speech-server` and drives AVSpeechSynthesizer on
+# that child's main thread with a real CFRunLoop.
 objc = "0.2"
 core-foundation = "0.9"
 core-foundation-sys = "0.8"
+
+[lints.rust]
+# The `objc` 0.2 macros expand `#[cfg(feature = "cargo-clippy")]` into this
+# crate; declare that value so clippy doesn't warn on every msg_send!.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
 [dev-dependencies]
 tempfile = "3.12"

@@ -11,30 +11,22 @@
 //! live Cocoa run loop on that process's main thread. This backend reproduces
 //! that design: it re-execs our own binary as `tdsr --speech-server`, and that
 //! child runs `AVSpeechSynthesizer` on its main thread with a real
-//! `CFRunLoopRun()`. The parent talks to it over a simple line protocol on the
-//! child's stdin:
-//!
-//! ```text
-//!   s<text>\n   speak text
-//!   l<text>\n   speak a letter (same handling as speak)
-//!   x\n         cancel/silence immediately
-//!   r<0-100>\n  set rate
-//!   v<0-100>\n  set volume
-//!   V<idx>\n    set voice index
-//! ```
+//! `CFRunLoopRun()`. The parent side is the generic [`CommandSynth`] in
+//! `command.rs`, which talks the line protocol described there (`s`, `l`,
+//! `x`, `r`, `v`, `V` lines) over the child's stdin.
 //!
 //! Flood safety: parent writes are small and the child's stdin reader drains
 //! into an unbounded channel, so a terminal dumping a huge amount of text can't
 //! block the parent's main thread or the keyboard. A keystroke already sends
 //! `x` (cancel) upstream, and the child coalesces its backlog so that cancel
 //! takes effect immediately instead of waiting behind queued utterances.
+//!
+//! When the parent runs with `--debug`, the child is started with `--debug`
+//! too and appends its own log lines to the same `tdsr.log`.
 
-use crate::speech::{SpeechCommand, Synth};
+use super::command::CommandSynth;
 use crate::{Result, TdsrError};
-use log::{debug, info};
-use std::io::{self, Write};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 /// CLI flag that puts the binary into speech-server mode.
 pub const SPEECH_SERVER_FLAG: &str = "--speech-server";
@@ -43,143 +35,35 @@ pub const SPEECH_SERVER_FLAG: &str = "--speech-server";
 // Parent side: spawns and talks to the speech-server subprocess.
 // ===========================================================================
 
-/// Speech synthesizer that drives a `tdsr --speech-server` child process.
-pub struct AvServerSynth {
-    /// Path to our own executable, re-execed in speech-server mode.
-    exe: PathBuf,
-    child: Option<Child>,
-    // Cached settings so they can be re-applied if the child is respawned.
-    rate: Option<u8>,
-    volume: Option<u8>,
-    voice_idx: Option<usize>,
+/// Start our own executable as `tdsr --speech-server` and return a synth
+/// that talks to it. Passes `--debug` through when debug logging is on so
+/// the child appends to the same `tdsr.log`.
+pub fn spawn_server_synth() -> Result<CommandSynth> {
+    let exe = std::env::current_exe().map_err(|e| {
+        TdsrError::Speech(format!(
+            "Cannot locate current executable for speech server: {}",
+            e
+        ))
+    })?;
+    let mut args = vec![SPEECH_SERVER_FLAG.to_string()];
+    if log::log_enabled!(log::Level::Debug) {
+        args.push("--debug".to_string());
+    }
+    CommandSynth::new(exe.to_string_lossy().into_owned(), args)
 }
 
-impl AvServerSynth {
-    pub fn new() -> Result<Self> {
-        let exe = std::env::current_exe().map_err(|e| {
-            TdsrError::Speech(format!("Cannot locate current executable for speech server: {}", e))
-        })?;
-        let mut synth = Self {
-            exe,
-            child: None,
-            rate: None,
-            volume: None,
-            voice_idx: None,
-        };
-        synth.spawn()?;
-        info!("AVFoundation speech server started: {:?}", synth.exe);
-        Ok(synth)
-    }
-
-    fn spawn(&mut self) -> Result<()> {
-        let child = Command::new(&self.exe)
-            .arg(SPEECH_SERVER_FLAG)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| TdsrError::Speech(format!("Failed to spawn speech server: {}", e)))?;
-        self.child = Some(child);
-
-        // Re-apply cached settings (best effort; a fresh child has defaults).
-        if let Some(r) = self.rate {
-            let _ = self.try_write(&format!("r{}", r));
-        }
-        if let Some(v) = self.volume {
-            let _ = self.try_write(&format!("v{}", v));
-        }
-        if let Some(i) = self.voice_idx {
-            let _ = self.try_write(&format!("V{}", i));
-        }
-        Ok(())
-    }
-
-    /// Write one protocol line, respawning the child once if the pipe broke.
-    fn write_line(&mut self, line: &str) -> Result<()> {
-        if self.try_write(line).is_err() {
-            debug!("Speech server pipe broken; respawning");
-            self.spawn()?;
-            self.try_write(line)
-                .map_err(|e| TdsrError::Speech(format!("Speech server write failed: {}", e)))?;
-        }
-        Ok(())
-    }
-
-    fn try_write(&mut self, line: &str) -> io::Result<()> {
-        let child = self
-            .child
-            .as_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "no speech server"))?;
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "speech server stdin closed"))?;
-        stdin.write_all(line.as_bytes())?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()
-    }
-}
-
-impl Drop for AvServerSynth {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-/// Strip framing-breaking newlines; the child handles the rest of the cleanup.
-fn sanitize(text: &str) -> String {
-    text.replace(['\n', '\r'], " ")
-}
-
-impl Synth for AvServerSynth {
-    fn send(&mut self, cmd: SpeechCommand) -> Result<()> {
-        match cmd {
-            SpeechCommand::Speak(t) => self.speak(&t),
-            SpeechCommand::Letter(c) => self.letter(&c.to_string()),
-            SpeechCommand::Cancel => self.cancel(),
-            SpeechCommand::SetRate(r) => self.set_rate(r),
-            SpeechCommand::SetVolume(v) => self.set_volume(v),
-            SpeechCommand::SetVoiceIdx(i) => self.set_voice_idx(i),
-        }
-    }
-
-    fn set_rate(&mut self, rate: u8) -> Result<()> {
-        self.rate = Some(rate);
-        self.write_line(&format!("r{}", rate))
-    }
-
-    fn set_volume(&mut self, volume: u8) -> Result<()> {
-        self.volume = Some(volume);
-        self.write_line(&format!("v{}", volume))
-    }
-
-    fn set_voice_idx(&mut self, idx: usize) -> Result<()> {
-        self.voice_idx = Some(idx);
-        self.write_line(&format!("V{}", idx))
-    }
-
-    fn speak(&mut self, text: &str) -> Result<()> {
-        let text = sanitize(text);
-        if text.is_empty() {
-            return Ok(());
-        }
-        self.write_line(&format!("s{}", text))
-    }
-
-    fn letter(&mut self, text: &str) -> Result<()> {
-        let text = sanitize(text);
-        if text.is_empty() {
-            return Ok(());
-        }
-        self.write_line(&format!("l{}", text))
-    }
-
-    fn cancel(&mut self) -> Result<()> {
-        self.write_line("x")
-    }
+/// Speak `text` through the system `say` command and wait for it to finish.
+///
+/// Last-resort path for announcing a fatal startup error when our own speech
+/// server could not be started: a blind user cannot read the message on
+/// stderr, and `say` is always present on macOS. Failures are ignored.
+pub fn say_blocking(text: &str) {
+    let _ = Command::new("/usr/bin/say")
+        .arg(text)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 // ===========================================================================
@@ -187,7 +71,7 @@ impl Synth for AvServerSynth {
 // ===========================================================================
 
 mod server {
-    use super::SpeechCommand;
+    use crate::speech::SpeechCommand;
     use core_foundation::base::TCFType;
     use core_foundation::string::CFString;
     use core_foundation_sys::runloop::{
@@ -203,8 +87,9 @@ mod server {
     use std::ptr;
     use std::sync::mpsc::{channel, Receiver, Sender};
 
-    // Link the frameworks directly so they're present regardless of `tts`.
+    // Link the frameworks directly.
     #[link(name = "AVFoundation", kind = "framework")]
+    extern "C" {}
     #[link(name = "Foundation", kind = "framework")]
     extern "C" {}
 
@@ -233,7 +118,10 @@ mod server {
         rate: f32,
         /// 0.0..=1.0.
         volume: f32,
-        voice_idx: Option<usize>,
+        /// Voice selected by an explicit `voice_idx`, resolved once when the
+        /// index is set and retained. `speechVoices()` enumerates every
+        /// installed voice and is far too slow to call per utterance.
+        selected_voice: Option<Id>,
         /// Whether `setPrefersAssistiveTechnologySettings:` exists (macOS 14+).
         prefers_at: bool,
         /// Voice used when no explicit `voice_idx` is set — Eloquence if it is
@@ -277,7 +165,7 @@ mod server {
                 SpeechCommand::Cancel => self.cancel(),
                 SpeechCommand::SetRate(r) => self.rate = (r as f32 / 100.0).clamp(0.0, 1.0),
                 SpeechCommand::SetVolume(v) => self.volume = (v as f32 / 100.0).clamp(0.0, 1.0),
-                SpeechCommand::SetVoiceIdx(idx) => self.voice_idx = Some(idx),
+                SpeechCommand::SetVoiceIdx(idx) => self.select_voice(idx),
             }
         }
 
@@ -306,24 +194,32 @@ mod server {
                 // default voice (Eloquence if installed); otherwise follow the
                 // system assistive-technology (VoiceOver) voice, which is the
                 // only way to reach VoiceOver's Siri voices.
-                let mut voice_set = false;
-                if let Some(idx) = self.voice_idx {
-                    if let Some(voice) = self.voice_at(idx) {
-                        let _: () = msg_send![utterance, setVoice: voice];
-                        voice_set = true;
-                    }
-                }
-                if !voice_set {
-                    if let Some(voice) = self.default_voice {
-                        let _: () = msg_send![utterance, setVoice: voice];
-                        voice_set = true;
-                    }
-                }
-                if !voice_set && self.prefers_at {
+                if let Some(voice) = self.selected_voice.or(self.default_voice) {
+                    let _: () = msg_send![utterance, setVoice: voice];
+                } else if self.prefers_at {
                     let _: () = msg_send![utterance, setPrefersAssistiveTechnologySettings: YES];
                 }
 
                 let _: () = msg_send![self.synth, speakUtterance: utterance];
+            }
+        }
+
+        /// Resolve `idx` against `speechVoices()` once and keep the voice
+        /// retained. An out-of-range index clears the selection so speech
+        /// falls back to the default voice instead of going silent.
+        fn select_voice(&mut self, idx: usize) {
+            // Safety: main thread; the previous voice was retained by us.
+            unsafe {
+                if let Some(old) = self.selected_voice.take() {
+                    let _: () = msg_send![old, release];
+                }
+                match self.voice_at(idx) {
+                    Some(voice) => {
+                        let retained: Id = msg_send![voice, retain];
+                        self.selected_voice = Some(retained);
+                    }
+                    None => debug!("speech-server: voice index {} out of range", idx),
+                }
             }
         }
 
@@ -362,7 +258,9 @@ mod server {
         if utf8.is_null() {
             return String::new();
         }
-        std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+        std::ffi::CStr::from_ptr(utf8)
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// Whether a voice's identifier marks it as an Eloquence voice. Apple's
@@ -441,8 +339,10 @@ mod server {
     /// Print the installed AVFoundation voices with their indices, then exit.
     /// Runs synchronously — no run loop required.
     pub fn list_voices() -> ! {
-        // Safety: enumerating voices is a synchronous class-method call.
+        // Safety: enumerating voices is a synchronous class-method call. The
+        // autorelease pool owns the voices array and the strings we read.
         unsafe {
+            let pool: Id = msg_send![class!(NSAutoreleasePool), new];
             let voices: Id = msg_send![class!(AVSpeechSynthesisVoice), speechVoices];
             let count: usize = if voices.is_null() {
                 0
@@ -460,7 +360,7 @@ mod server {
                 "Note: VoiceOver's Siri voices are not listed here — they are only\n      \
                  reachable via the default (VoiceOver-follow) setting.\n"
             );
-            println!("{:>4}  {:<30}  {:<8}  {}", "idx", "name", "lang", "quality");
+            println!("{:>4}  {:<30}  {:<8}  quality", "idx", "name", "lang");
             for i in 0..count {
                 let v: Id = msg_send![voices, objectAtIndex: i];
                 let name_id: Id = msg_send![v, name];
@@ -482,6 +382,7 @@ mod server {
                 };
                 println!("{:>4}  {:<30}  {:<8}  {}{}", i, name, lang, q, tag);
             }
+            let _: () = msg_send![pool, release];
         }
         std::process::exit(0);
     }
@@ -517,8 +418,15 @@ mod server {
             let _: () = msg_send![probe, release];
 
             // Default to Eloquence when installed; falls back to VoiceOver.
+            // The voices array is autoreleased, so give it a pool to drain
+            // into (the chosen voice is retained separately).
+            let pool: Id = msg_send![class!(NSAutoreleasePool), new];
             let default_voice = find_default_voice();
-            debug!("speech-server default voice resolved: {}", default_voice.is_some());
+            let _: () = msg_send![pool, release];
+            debug!(
+                "speech-server default voice resolved: {}",
+                default_voice.is_some()
+            );
 
             let (tx, rx) = channel::<SpeechCommand>();
             let worker = Box::new(Worker {
@@ -526,7 +434,7 @@ mod server {
                 synth,
                 rate: 0.5,
                 volume: 1.0,
-                voice_idx: None,
+                selected_voice: None,
                 prefers_at,
                 default_voice,
             });
@@ -637,11 +545,22 @@ mod server {
 
         #[test]
         fn parse_line_handles_protocol() {
-            assert!(matches!(parse_line(b"shello\n"), Some(SpeechCommand::Speak(s)) if s == "hello"));
+            assert!(
+                matches!(parse_line(b"shello\n"), Some(SpeechCommand::Speak(s)) if s == "hello")
+            );
             assert!(matches!(parse_line(b"x\n"), Some(SpeechCommand::Cancel)));
-            assert!(matches!(parse_line(b"r50\n"), Some(SpeechCommand::SetRate(50))));
-            assert!(matches!(parse_line(b"v80\n"), Some(SpeechCommand::SetVolume(80))));
-            assert!(matches!(parse_line(b"V3\n"), Some(SpeechCommand::SetVoiceIdx(3))));
+            assert!(matches!(
+                parse_line(b"r50\n"),
+                Some(SpeechCommand::SetRate(50))
+            ));
+            assert!(matches!(
+                parse_line(b"v80\n"),
+                Some(SpeechCommand::SetVolume(80))
+            ));
+            assert!(matches!(
+                parse_line(b"V3\n"),
+                Some(SpeechCommand::SetVoiceIdx(3))
+            ));
             assert!(parse_line(b"\n").is_none());
             assert!(parse_line(b"zbogus\n").is_none());
         }

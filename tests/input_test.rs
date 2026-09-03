@@ -1,43 +1,50 @@
 //! Input system tests
 //!
-//! Tests key handler stack and key binding system
+//! Tests the handler stack container and the default key bindings. Key
+//! *dispatch* through the stack (with a real State) is covered by
+//! `modal_input_test.rs`.
 
 use tdsr::input::{create_default_keymap, HandlerAction, HandlerStack, KeyAction, KeyHandler};
+use tdsr::state::State;
+use tdsr::terminal::Emulator;
 use tdsr::Result;
 
-struct TestHandler {
-    handled: bool,
-}
+struct Tag;
 
-impl KeyHandler for TestHandler {
-    fn process(&mut self, key: &[u8]) -> Result<HandlerAction> {
-        if key == b"x" {
-            self.handled = true;
-            Ok(HandlerAction::Remove)
-        } else {
-            Ok(HandlerAction::Passthrough)
-        }
+impl KeyHandler for Tag {
+    fn process_with_context(
+        &mut self,
+        _key: &[u8],
+        _state: &mut State,
+        _emulator: &mut Emulator,
+    ) -> Result<HandlerAction> {
+        Ok(HandlerAction::Handled)
     }
 }
 
 #[test]
-fn test_handler_stack() {
+fn test_handler_stack_push_pop_insert() {
     let mut stack = HandlerStack::new();
-    assert_eq!(stack.len(), 0);
+    assert!(stack.is_empty());
 
-    // Push handler
-    stack.push(Box::new(TestHandler { handled: false }));
+    stack.push(Box::new(Tag));
+    stack.push(Box::new(Tag));
+    assert_eq!(stack.len(), 2);
+
+    // Popping returns the top; inserting at 0 puts a handler underneath.
+    let top = stack.pop().unwrap();
     assert_eq!(stack.len(), 1);
+    stack.insert(0, top);
+    assert_eq!(stack.len(), 2);
 
-    // Process key that handler doesn't recognize
-    let action = stack.process(b"a").unwrap();
-    assert_eq!(action, HandlerAction::Passthrough);
-    assert_eq!(stack.len(), 1);
+    // An out-of-range index clamps to the top.
+    stack.insert(99, Box::new(Tag));
+    assert_eq!(stack.len(), 3);
 
-    // Process key that handler handles and removes itself
-    let action = stack.process(b"x").unwrap();
-    assert_eq!(action, HandlerAction::Remove);
-    assert_eq!(stack.len(), 0);
+    stack.pop();
+    stack.pop();
+    stack.pop();
+    assert!(stack.pop().is_none());
 }
 
 /// Helper to look up a key sequence in the keymap without triggering clippy
@@ -79,24 +86,4 @@ fn test_keymap_creation() {
         lookup(&keymap, b"\x1b,\x1b,"),
         Some(KeyAction::SayCharPhonetic)
     );
-}
-
-#[test]
-fn test_handler_stack_multiple() {
-    let mut stack = HandlerStack::new();
-
-    // Push two handlers
-    stack.push(Box::new(TestHandler { handled: false }));
-    stack.push(Box::new(TestHandler { handled: false }));
-    assert_eq!(stack.len(), 2);
-
-    // Top handler processes
-    let action = stack.process(b"x").unwrap();
-    assert_eq!(action, HandlerAction::Remove);
-    assert_eq!(stack.len(), 1);
-
-    // Now second handler processes
-    let action = stack.process(b"x").unwrap();
-    assert_eq!(action, HandlerAction::Remove);
-    assert_eq!(stack.len(), 0);
 }

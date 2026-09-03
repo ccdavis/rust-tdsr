@@ -10,5 +10,5 @@ pub mod util;
 pub use cell::Cell;
 pub use emulator::Emulator;
 pub use pty::Pty;
-pub use screen::Screen;
+pub use screen::{Charset, Screen};
 pub use util::{get_terminal_size, restore_termios, set_raw_mode};

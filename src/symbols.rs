@@ -38,12 +38,22 @@ pub fn condense_repeated_chars(
 
             if count > 1 {
                 // Get symbol name or use the character itself
-                let char_name = symbols.get(&(ch as u32)).map(|s| s.as_str()).unwrap_or("");
+                let name = symbols.get(&(ch as u32)).map(|s| s.as_str()).unwrap_or("");
 
-                if char_name.is_empty() {
-                    result.push_str(&format!("{} {}", count, ch));
+                // Keep the count and name as their own words: "hello===world"
+                // must read as "hello 3 equals world", not "hello3 equalsworld".
+                if !result.is_empty() && !result.ends_with(' ') {
+                    result.push(' ');
+                }
+                result.push_str(&count.to_string());
+                result.push(' ');
+                if name.is_empty() {
+                    result.push(ch);
                 } else {
-                    result.push_str(&format!("{} {}", count, char_name));
+                    result.push_str(name);
+                }
+                if chars.peek().is_some_and(|&next| next != ' ') {
+                    result.push(' ');
                 }
             } else {
                 result.push(ch);
@@ -70,7 +80,7 @@ mod tests {
 
         // Multiple groups
         let result = condense_repeated_chars("===---", "-=", &symbols);
-        assert_eq!(result, "3 =3 -");
+        assert_eq!(result, "3 = 3 -");
 
         // With symbol names
         let mut symbols_with_names = HashMap::new();
@@ -84,6 +94,10 @@ mod tests {
 
         // Mixed content
         let result = condense_repeated_chars("hello===world", "=", &symbols);
-        assert_eq!(result, "hello3 =world");
+        assert_eq!(result, "hello 3 = world");
+
+        // Existing spaces are not doubled
+        let result = condense_repeated_chars("a ==== b", "=", &symbols);
+        assert_eq!(result, "a 4 = b");
     }
 }

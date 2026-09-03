@@ -6,8 +6,6 @@
 use crate::platform::is_wsl;
 use crate::Result;
 use log::info;
-#[cfg(target_os = "macos")]
-use log::warn;
 
 /// Commands sent to speech backend
 ///
@@ -69,11 +67,31 @@ pub trait Synth: Send {
 /// 2. PulseAudio + espeak-ng (fallback if Speech Dispatcher unavailable)
 ///
 /// **macOS:**
-/// - AVFoundation (via tts crate native bindings)
+/// - AVFoundation, driven by a `tdsr --speech-server` subprocess (the only
+///   backend; if it cannot start, the error is spoken through `say` and
+///   returned so TDSR exits with a clear message rather than running silent)
+///
+/// **Any platform:** `speech_command` (config `[speech] speech_command` or
+/// `--speech-command`) names an external program that speaks the TDSR line
+/// protocol; when set it is used instead of the platform backend.
 ///
 /// All backends provide helpful error messages when unavailable.
-pub fn create_synth() -> Result<Box<dyn Synth>> {
+pub fn create_synth(speech_command: Option<&str>) -> Result<Box<dyn Synth>> {
     let platform = std::env::consts::OS;
+
+    if let Some(cmd) = speech_command {
+        info!("Using external speech server: {}", cmd);
+        use super::backends::command::CommandSynth;
+        return match CommandSynth::from_command_line(cmd) {
+            Ok(synth) => Ok(Box::new(synth)),
+            Err(e) => {
+                let msg = format!("Could not start speech_command '{}': {}", cmd, e);
+                #[cfg(target_os = "macos")]
+                super::backends::avfoundation::say_blocking(&msg);
+                Err(crate::TdsrError::Speech(msg))
+            }
+        };
+    }
 
     // Special case: WSL (Linux with Windows interop)
     if platform == "linux" && is_wsl() {
@@ -108,7 +126,7 @@ pub fn create_synth() -> Result<Box<dyn Synth>> {
         }
 
         // Fall back to Speech Dispatcher (only when built with `native-speech`)
-        #[cfg(feature = "native-speech")]
+        #[cfg(all(feature = "native-speech", not(target_os = "macos")))]
         {
             info!("Trying Speech Dispatcher backend...");
             use super::backends::native::NativeSynth;
@@ -139,7 +157,7 @@ pub fn create_synth() -> Result<Box<dyn Synth>> {
 
         // Try Speech Dispatcher first (standard Linux TTS), if compiled in.
         // Builds without `native-speech` skip straight to PulseAudio + espeak-ng.
-        #[cfg(feature = "native-speech")]
+        #[cfg(all(feature = "native-speech", not(target_os = "macos")))]
         {
             info!("Trying Speech Dispatcher backend...");
             use super::backends::native::NativeSynth;
@@ -177,31 +195,34 @@ pub fn create_synth() -> Result<Box<dyn Synth>> {
         }
     }
 
-    // macOS: dedicated AVFoundation backend with its own CFRunLoop.
-    // AVSpeechSynthesizer only advances its utterance queue while a run loop is
-    // serviced; running it on a dedicated thread keeps speech working and
-    // decoupled from the mio I/O loop. Falls back to the tts crate on failure.
+    // macOS: the AVFoundation speech-server subprocess is the only backend.
+    // There is no in-process fallback (it would play one utterance and go
+    // silent), so on failure speak the reason through the system `say`
+    // command — the user is likely blind and cannot read stderr — and bail.
     #[cfg(target_os = "macos")]
     {
         info!("Trying AVFoundation speech-server backend...");
-        use super::backends::avfoundation::AvServerSynth;
+        use super::backends::avfoundation::{say_blocking, spawn_server_synth};
 
-        match AvServerSynth::new() {
+        match spawn_server_synth() {
             Ok(synth) => {
                 info!("✓ Successfully initialized AVFoundation speech-server backend");
-                return Ok(Box::new(synth));
+                Ok(Box::new(synth))
             }
             Err(e) => {
-                warn!(
-                    "✗ AVFoundation backend unavailable: {}; falling back to tts crate",
+                let msg = format!(
+                    "TDSR could not start the macOS speech server and is exiting. {}",
                     e
                 );
+                log::error!("{}", msg);
+                say_blocking(&msg);
+                Err(crate::TdsrError::Speech(msg))
             }
         }
     }
 
-    // Other platforms (and macOS fallback): native tts crate, if compiled in.
-    #[cfg(feature = "native-speech")]
+    // Other platforms: native tts crate, if compiled in.
+    #[cfg(all(feature = "native-speech", not(target_os = "macos")))]
     {
         info!(
             "Creating native speech synthesizer for platform: {}",
@@ -221,7 +242,7 @@ pub fn create_synth() -> Result<Box<dyn Synth>> {
         }
     }
 
-    #[cfg(not(feature = "native-speech"))]
+    #[cfg(all(not(feature = "native-speech"), not(target_os = "macos")))]
     {
         Err(crate::TdsrError::Speech(format!(
             "No speech backend available for platform '{}'. This binary was built \

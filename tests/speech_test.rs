@@ -1,34 +1,46 @@
 //! Integration tests for speech synthesis
 //!
-//! These tests verify that the native TTS backend works correctly
-//! across different operations and configurations.
+//! These exercise the real platform backend (on macOS that means spawning the
+//! speech-server subprocess, which can be audible). They are opt-in: set
+//! `TDSR_AUDIO_TESTS=1` to run them; otherwise each test returns immediately.
 
 use tdsr::speech::synth::create_synth;
+use tdsr::speech::Synth;
+use tdsr::Result;
+
+/// Create the real synth, or `None` when audio tests are not opted in or no
+/// backend is available (CI, headless).
+fn real_synth() -> Option<Box<dyn Synth>> {
+    if std::env::var_os("TDSR_AUDIO_TESTS").is_none() {
+        println!("⚠ Skipping: set TDSR_AUDIO_TESTS=1 to run real speech backend tests");
+        return None;
+    }
+    let result: Result<Box<dyn Synth>> = create_synth(None);
+    match result {
+        Ok(mut synth) => {
+            // Keep the machine quiet while testing
+            let _ = synth.set_volume(0);
+            Some(synth)
+        }
+        Err(e) => {
+            println!("⚠ TTS creation failed (may be expected): {}", e);
+            None
+        }
+    }
+}
 
 #[test]
 fn test_create_native_synth() {
-    // Test that we can create a native TTS synthesizer
-    let result = create_synth();
-
-    match result {
-        Ok(synth) => {
-            println!("✓ Successfully created native TTS backend");
-            drop(synth);
-        }
-        Err(e) => {
-            // This may fail in CI or environments without speech-dispatcher
-            println!("⚠ TTS creation failed (may be expected): {}", e);
-            // Don't panic - this is acceptable in headless environments
-        }
+    if let Some(synth) = real_synth() {
+        println!("✓ Successfully created platform speech backend");
+        drop(synth);
     }
 }
 
 #[test]
 fn test_speech_configuration() {
     // Test that we can configure speech parameters
-    let result = create_synth();
-
-    if let Ok(mut synth) = result {
+    if let Some(mut synth) = real_synth() {
         // Test rate setting
         assert!(synth.set_rate(50).is_ok(), "Should set rate to 50");
         assert!(synth.set_rate(0).is_ok(), "Should set rate to 0");
@@ -52,9 +64,7 @@ fn test_speech_configuration() {
 #[test]
 fn test_speech_operations() {
     // Test that we can perform basic speech operations
-    let result = create_synth();
-
-    if let Ok(mut synth) = result {
+    if let Some(mut synth) = real_synth() {
         // These operations should not error, even if speech doesn't actually play
         // (which may happen in CI or headless environments)
 
@@ -85,9 +95,7 @@ fn test_speech_operations() {
 #[test]
 fn test_speech_unicode() {
     // Test handling of Unicode characters
-    let result = create_synth();
-
-    if let Ok(mut synth) = result {
+    if let Some(mut synth) = real_synth() {
         // Test various Unicode strings
         assert!(
             synth.speak("Hello 世界").is_ok(),
@@ -110,9 +118,7 @@ fn test_speech_unicode() {
 #[test]
 fn test_speech_rate_sequence() {
     // Test changing rate multiple times
-    let result = create_synth();
-
-    if let Ok(mut synth) = result {
+    if let Some(mut synth) = real_synth() {
         for rate in [25, 50, 75, 100] {
             assert!(synth.set_rate(rate).is_ok(), "Should set rate to {}", rate);
         }

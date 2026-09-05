@@ -80,6 +80,9 @@ objc = "0.2"
 core-foundation = "0.9"
 core-foundation-sys = "0.8"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = "0.8"
+
 [lints.rust]
 # The `objc` 0.2 macros expand `#[cfg(feature = "cargo-clippy")]` into this
 # crate; declare that value so clippy doesn't warn on every msg_send!.

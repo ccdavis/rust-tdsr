@@ -53,6 +53,27 @@ pub trait Synth: Send {
     fn cancel(&mut self) -> Result<()>;
 }
 
+/// Try the in-process espeak-ng backend (Linux and WSL only).
+#[cfg(target_os = "linux")]
+fn try_espeak_in_process() -> Option<Box<dyn Synth>> {
+    info!("Trying espeak-ng in-process backend...");
+    match super::backends::espeak::EspeakSynth::new() {
+        Ok(synth) => {
+            info!("✓ Successfully initialized espeak-ng in-process backend");
+            Some(Box::new(synth))
+        }
+        Err(e) => {
+            info!("✗ espeak-ng in-process backend unavailable: {}", e);
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_espeak_in_process() -> Option<Box<dyn Synth>> {
+    None
+}
+
 /// Create a platform-appropriate speech synthesizer
 ///
 /// Automatically detects the environment and selects the best backend:
@@ -97,7 +118,13 @@ pub fn create_synth(speech_command: Option<&str>) -> Result<Box<dyn Synth>> {
     if platform == "linux" && is_wsl() {
         info!("Detected WSL environment");
 
-        // Try PulseAudio backend first (best performance on WSL with WSLG)
+        // In-process espeak-ng with our own PulseAudio playback first: it is
+        // the only backend that keeps WSLg's audio pipeline responsive.
+        if let Some(synth) = try_espeak_in_process() {
+            return Ok(synth);
+        }
+
+        // Then espeak-ng subprocesses through PulseAudio
         info!("Trying PulseAudio + espeak-ng backend...");
         use super::backends::pulseaudio::PulseAudioSynth;
 
@@ -144,7 +171,7 @@ pub fn create_synth(speech_command: Option<&str>) -> Result<Box<dyn Synth>> {
 
         return Err(crate::TdsrError::Speech(
             "No speech backend available on WSL. Tried:\n\
-             1. PulseAudio + espeak-ng (install: sudo apt install espeak-ng)\n\
+             1. espeak-ng + PulseAudio (install: sudo apt install espeak-ng)\n\
              2. Windows SAPI (PowerShell not available)\n\
              3. Speech Dispatcher (not configured, or built without 'native-speech')"
                 .to_string(),
@@ -174,7 +201,12 @@ pub fn create_synth(speech_command: Option<&str>) -> Result<Box<dyn Synth>> {
             }
         }
 
-        // Fall back to PulseAudio + espeak-ng
+        // Fall back to espeak-ng: in-process with our own playback, then
+        // subprocesses through PulseAudio
+        if let Some(synth) = try_espeak_in_process() {
+            return Ok(synth);
+        }
+
         info!("Trying PulseAudio + espeak-ng backend...");
         use super::backends::pulseaudio::PulseAudioSynth;
 
@@ -187,7 +219,7 @@ pub fn create_synth(speech_command: Option<&str>) -> Result<Box<dyn Synth>> {
                 return Err(crate::TdsrError::Speech(format!(
                     "No speech backend available on Linux. Tried:\n\
                      1. Speech Dispatcher (install: sudo apt install speech-dispatcher)\n\
-                     2. PulseAudio + espeak-ng (install: sudo apt install espeak-ng)\n\
+                     2. espeak-ng + PulseAudio (install: sudo apt install espeak-ng)\n\
                      Error: {}",
                     e
                 )));

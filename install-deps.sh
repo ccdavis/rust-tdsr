@@ -134,7 +134,9 @@ case "$PM" in
         INSTALL=("$SUDO" apt-get install)
         [[ $ASSUME_YES -eq 1 ]] && INSTALL+=(-y)
         BUILD=(libclang-dev libspeechd-dev pkg-config build-essential)
-        RUNTIME=(speech-dispatcher espeak-ng xclip wl-clipboard)
+        # pulseaudio-utils provides parec, which the espeak-ng backend uses on
+        # WSLg to wake the audio sink after a pause.
+        RUNTIME=(speech-dispatcher espeak-ng pulseaudio-utils xclip wl-clipboard)
         MBROLA=(mbrola mbrola-us1 mbrola-us2)
         ;;
     dnf)

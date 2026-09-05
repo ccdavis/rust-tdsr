@@ -2,6 +2,7 @@
 
 pub mod backends;
 pub mod buffer;
+pub mod resample;
 pub mod synth;
 
 pub use buffer::SpeechBuffer;

@@ -6,7 +6,7 @@ TDSR automatically detects WSL and selects the best available speech backend.
 
 On WSL, TDSR tries speech backends in this order:
 
-1. **PulseAudio + espeak-ng** (lowest latency, best for interactive use)
+1. **espeak-ng in-process + PulseAudio** (lowest latency, best for interactive use; falls back to espeak-ng subprocesses)
 2. **Windows SAPI** via PowerShell (higher latency, but uses Windows voices)
 3. **Speech Dispatcher** (fallback)
 
@@ -37,6 +37,10 @@ sudo apt install libclang-dev libspeechd-dev
 ```bash
 # Required: espeak-ng for speech
 sudo apt install espeak-ng
+
+# Optional: parec (pulseaudio-utils), used only by the subprocess fallback
+# backend to wake WSLg's audio sink after a pause (see "How It Works")
+sudo apt install pulseaudio-utils
 
 # Optional: MBROLA for higher quality voices
 sudo apt install mbrola mbrola-us1 mbrola-us2
@@ -107,14 +111,54 @@ voice_idx = 10    # MBROLA US English Female
 ```
 TDSR (Rust binary)
     ↓
-PulseAudio + espeak-ng backend
+Audio thread: libespeak-ng (in-process) → 20 ms PCM chunks → 44100 Hz
     ↓
-Persistent espeak-ng process (reads stdin line-by-line)
+TDSR's own PulseAudio playback stream (40 ms buffer, opened only while
+sound is playing; pauses are silent gaps with the stream closed)
     ↓
-WSLG PulseAudio → Windows audio output
+WSLG PulseAudio → RDP audio (module-rdp-sink, 5 ms blocks) → Windows audio output
 ```
 
 TDSR detects WSL by checking `/proc/version` for "microsoft" or "wsl".
+
+If `libespeak-ng.so.1` or `libpulse-simple.so.0` cannot be loaded, TDSR
+falls back to running `espeak-ng` as a subprocess per utterance (and then to
+Windows SAPI and Speech Dispatcher).
+
+### Why TDSR manages the audio stream itself on WSL
+
+WSLg's RDP audio sink forwards audio to Windows in 5 ms blocks and allows up
+to 1.3 s of them to be outstanding. The Windows side plays those blocks a
+few percent slower than the sink sends them, so during continuous audio the
+backlog on the Windows side grows by tens of milliseconds per second. It
+grows with silence too: an open stream that carries nothing still makes the
+sink send silence. Audio already forwarded cannot be cancelled, so a key
+echo typed after a long read would only be heard after the backlog, and once
+the backlog saturates the WSLg PulseAudio server stops responding to clients
+altogether (speech goes dead until WSLg's `pulseaudio` is restarted, e.g.
+with `wsl --shutdown`).
+
+The backlog only shrinks while the sink has no stream at all, so TDSR
+transmits sound and nothing else. espeak-ng's own pauses (between clauses
+and at the end of each line) are not sent as silent samples: the stream is
+closed for their duration and reopened for the next sound, so the cadence is
+unchanged but every pause lets Windows catch up. While sound is streaming,
+the stream's reported latency (on WSL, the client's measured playback delay)
+is checked every 250 ms and a short silent gap inserted if it exceeds
+200 ms. The stream is closed whenever nothing is playing, and `cancel`
+discards the 40 ms the server holds, so what you hear after a key press is
+at most a few tens of milliseconds of the old speech.
+
+The sink also never resets its pacing clock when it resumes from suspend
+(PulseAudio suspends it 5 s after the last stream closes), and the first
+stream after such a pause bursts a backlog to Windows. TDSR keeps the sink
+awake, without sending anything, by holding a recording of the sink's
+monitor source for as long as it runs.
+
+What remains is the RDP audio path itself: measured on WSL2, a sample
+written to PulseAudio is heard roughly 45 to 55 ms later, and that floor
+cannot be lowered from inside WSL. On native Linux the same backend gets
+the sound card's latency instead, typically 10 to 30 ms.
 
 For the fallback SAPI backend:
 ```

@@ -1,6 +1,9 @@
 [speech]
 process_symbols = False
 prompt = .*
+tui_mode = auto
+tui_apps = fp,mc
+tui_settle = 30
 
 [commands]
 

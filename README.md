@@ -152,7 +152,47 @@ line_pause = true        # Pause between lines
 repeated_symbols = false
 repeated_symbols_values = -=!#
 prompt = .*         # Regex for prompt (plugin system)
+tui_mode = auto     # TUI mode for full-screen programs: auto, apps, on or off
+
+tui_apps = fp,mc    # Programs (process names) that always get TUI mode
+tui_settle = 30     # Milliseconds of quiet before the screen is compared
+tui_announce = true # Say "TUI mode on/off" when it switches
 ```
+
+### TUI Mode (menus and dialogs)
+
+Full-screen programs such as the Free Pascal IDE (`fp`), Midnight Commander,
+`dialog`/`whiptail` and ncurses menus do not print text to read: they mark
+the selected item with a colour, hide or park the cursor, and repaint only
+the cells that changed. Read as a stream, that comes out as fragments of
+repaints. In TUI mode TDSR instead compares the screen (characters and
+colours) before and after each keystroke, the way DOS screen readers
+diffed video memory, and speaks:
+
+- the item that just became highlighted ("File", "Show clipboard", "OK");
+- a window or dialog when it opens: its title, its text, then the focused
+  control. A drop-down menu is not read in full, only its selected item;
+- the line or character the cursor moved to in an editor, cut at the
+  window frame (typed characters are echoed as usual);
+- message lines, while counters and clocks that change on every keystroke
+  stay quiet.
+
+With `tui_mode = auto` (the default) TDSR switches it on when it sees a
+full-screen program drawn in several colours that enters the alternate
+screen or turns auto-wrap off, or a foreground process named in
+`tui_apps`. It announces "TUI mode on", and "TUI mode off" when the shell
+is back. Pagers and editors (`less`, `nano`, plain `vim`) are left alone;
+if a colourful editor does trigger it, `tui_mode = apps` limits TUI mode
+to the listed programs. `Alt+t` cycles auto, apps, on and off by hand (the
+setting is saved),
+
+`Alt+w` reads the current window or dialog again, and `Alt+h` repeats the
+highlighted item. The review cursor follows the highlight, so `Alt+i`,
+`Alt+k` and the rest work from there.
+
+Since every `Alt+letter` is a TDSR key, a program's own Alt accelerators
+(fp's `Alt+F` for the File menu works, `Alt+O` does not) may be taken by
+TDSR; use `F10` and the arrows in Turbo Vision style programs.
 
 ### Voice Selection (macOS)
 
@@ -295,6 +335,12 @@ character review all work, and `Alt+o` or `Alt+O` come back down.
 - `Alt+v` - Copy mode (then 'l' for line, 's' for screen)
 - `Alt+x` - Silence speech
 
+### TUI Mode
+- `Alt+t` - Cycle TUI mode: auto, apps, on, off
+
+- `Alt+w` - Read the current window or dialog
+- `Alt+h` - Repeat the highlighted item
+
 ## Configuration Menu (Alt+c)
 
 - `r` - Set speech rate
@@ -306,6 +352,8 @@ character review all work, and `Alt+o` or `Alt+O` come back down.
 - `c` - Toggle cursor tracking
 - `l` - Toggle line pause
 - `s` - Toggle repeated symbols
+- `t` - Cycle TUI mode (auto, apps, on, off)
+
 - `ESC` - Exit config menu
 
 ## Copy Mode (Alt+v)
@@ -365,13 +413,15 @@ Press `Alt+d` to run!
   - macOS: AVFoundation, driven by a `tdsr --speech-server` subprocess
   - Optional: MBROLA voices for higher quality speech (Linux/WSL)
 - **Input Handling** - Modal key handler stack
+- **TUI Mode** - Screen diffing (characters and colours) for menu-driven programs
 - **Plugin System** - JSON subprocess protocol
 
 ### Module Structure
 
 ```
 src/
-├── terminal/       # PTY, screen buffer, vte integration
+├── terminal/       # PTY, screen buffer, vte integration, cell attributes
+├── tui/            # TUI mode: screen diffing, frames, auto-detection
 ├── speech/         # TTS abstraction and backends
 ├── input/          # Key handlers and keymap
 ├── state/          # Application state and config
@@ -476,8 +526,9 @@ sudo apt install wl-clipboard
 - **Better Performance** - ~500ms startup (vs ~2s), ~15 MB memory (vs ~50 MB)
 - **Single Binary** - ~3 MB executable, copy anywhere
 - **Same Config** - Your `~/.tdsr.cfg` works unchanged
-- **Same Keys** - All Alt+key shortcuts identical
+- **Same Keys** - All Alt+key shortcuts identical (plus Alt+t/w/h for TUI mode)
 - **Plugins** - Same interface, run as JSON subprocesses
+- **TUI Mode** - Menus, dialogs and highlighted items in full-screen programs are read from screen diffs
 
 See [MIGRATION.md](MIGRATION.md) for upgrade guide.
 

@@ -40,12 +40,18 @@ src/
 ├── error.rs             # Crate error types
 ├── terminal/
 │   ├── mod.rs           # Module exports
-│   ├── pty.rs           # PTY spawn/resize (portable-pty)
+│   ├── pty.rs           # PTY spawn/resize (portable-pty), foreground process group
 │   ├── emulator.rs      # vte parser driver
 │   ├── performer.rs     # vte Perform impl → screen + speech buffer (largest file)
-│   ├── screen.rs        # Screen buffer + scrollback history
-│   ├── cell.rs          # Character cell
+│   ├── screen.rs        # Screen buffer + scrollback history, SGR/DECAWM/DECTCEM state
+│   ├── cell.rs          # Character cell (char + attributes)
+│   ├── attrs.rs         # SGR attributes: colours, bold/dim/underline/reverse
 │   └── util.rs          # termios raw mode, terminal size
+├── tui/
+│   ├── mod.rs           # TuiTracker: screen diffing for full-screen programs (menus, dialogs)
+│   ├── diff.rs          # Row/cell diff, changed spans, background statistics
+│   ├── frame.rs         # Box-frame detection, titles, decoration stripping
+│   └── detect.rs        # Auto-detection of full-screen programs (score + hysteresis)
 ├── speech/
 │   ├── mod.rs           # Speech module exports
 │   ├── synth.rs         # Synth trait and backend selection
@@ -84,7 +90,9 @@ src/
 
 **Event Loop** (`main.rs`): Uses `mio` to poll stdin and the PTY with a 100 ms timeout (select() on WSL). SIGWINCH sets a flag checked each iteration; an `Interrupted` poll result is treated as a timeout, not an error. The loop ends on PTY EOF/EIO or when `Pty::try_wait` reports the shell gone (after a short drain), and `run()` returns the shell's exit status, which becomes TDSR's.
 
-**Terminal Emulation** (`terminal/`): `emulator.rs` drives the `vte` ANSI parser; the custom `Perform` impl lives in `performer.rs` (the largest module) and is where screen-buffer updates and speech-buffer population happen — most output/announcement behavior changes go here. `pty.rs` owns the child PTY.
+**Terminal Emulation** (`terminal/`): `emulator.rs` drives the `vte` ANSI parser; the custom `Perform` impl lives in `performer.rs` (the largest module) and is where screen-buffer updates and speech-buffer population happen — most output/announcement behavior changes go here. `pty.rs` owns the child PTY. Every `Cell` carries its `Attrs` (SGR: `Color` fg/bg incl. 256-colour and RGB, bold/dim/underline/reverse; `Attrs::effective_bg` swaps on reverse, `is_bright_fg` excludes dark grey). `Screen` tracks the current `sgr`, `cursor_visible` (DECTCEM `?25`) and `autowrap` (DECAWM `?7`; off means the last column is overwritten, never wrapped); erases fill with the current background (bce). Leaving the alternate screen drops the text drawn on it during that burst.
+
+**TUI mode** (`tui/`): full-screen programs (Free Pascal IDE `fp`, Midnight Commander, `dialog`/`whiptail`, ncurses menus) mark the selected item with a colour change, hide or park the cursor and send only the cells that changed, so reading the print stream yields fragments. When active, `TuiTracker` drops the print stream and instead diffs the screen (chars + attrs) against a baseline once output has settled (`State::after_output` arms a flush after `tui_settle` ms, capped at 150 ms; `run_scheduled` runs `State::flush_tui`, which calls `TuiTracker::observe` and speaks `Announcement`s; a keypress drops a pending flush without advancing the baseline, since diffing screens loses nothing). Classification order in `observe`: a freshly drawn frame (all four corners and ≥50% of its border drawn in this burst; sides reaching the last row without a bottom border, like mc's tall File menu, count as a frame running off the screen with `bottom == rows`) is a **menu** (only the highlighted item is spoken, plus the bar item above it) when it hangs under a highlighted menu-bar item or beside an open menu and no visible cursor moved into it, else a **window** (title from the top border, interior lines with decoration stripped, then the focused item); otherwise the best-scoring changed span is the new **highlight** (score: attribute-only change, distinct background on its row / among the changed cells, one-row bar, bright foreground with plain siblings, gained emphasis, learned attrs, cursor on it; penalties for lost emphasis, going back to the row's ordinary rendition, dark-grey/dim text, overlapping the previous highlight); a frameless repaint of more than 3 rows is silent (menu closed); a visible cursor that moved reads its line clipped at vertical frame pieces (row change) or its character (column change), except after typed text; remaining single-row text changes with a real word are spoken as messages unless the row is volatile (changed in 3 of the last 4 bursts: counters, clocks). `detect.rs` decides `auto` mode: enter when the screen has ≥3 rows with ≥3 distinct backgrounds **and** the alternate screen was entered in this burst or auto-wrap is off, or at once when the foreground process name is in `tui_apps` (`tui_mode = apps` uses only the names). A hidden cursor is deliberately not a sign: nano keeps it hidden for most of a second in some states. A decaying score (alt +2, hidden +1, autowrap off +2, multi-bg +2) only decides quietness. Leave when the shell's process group is back in the foreground (`Pty::foreground_pgid` via `tcgetpgrp`, only after a foreign group was seen, so shells without job control are ignored), when the alternate screen is left (a listed name then does not re-enter until the foreground changes, so an exiting program does not flicker), or after 3 quiet bursts. `less`, `nano`, plain `vim` (no third background) do not activate; a vim colour scheme with backgrounds would. When a window, menu or page opens the tracker remembers the screen underneath (`underlays`, 3 deep); a repaint that mostly restores one of them is a close: only the highlight there (and any rewritten message row) is spoken, never the repaint. A window whose frame, title and text were read before is not read again (`windows`). Keys: Alt+t cycles auto/apps/on/off (saved as `tui_mode`), Alt+w reads the innermost frame around the highlight/cursor (else the last window, else the screen), Alt+h repeats the highlight. Arrow keys skip the ordinary delayed line/char reads while TUI mode is active. **Fixtures:** `tools/capture_tui.py` records real programs in a pty, one `.bin` per keystroke under `tests/fixtures/<app>/`; `tests/tui_test.rs` replays them through the same path `main` uses and asserts the spoken text (fp: menus, dropdowns, editor typing/cursor, the SwitchesMode dialog with Tab, the exit prompt; whiptail; mc: panels, Tab, F9 menus, viewer; `ls --color`, `less` and `nano` must stay in ordinary mode). mc needs `-u` (no subshell) and application-mode arrows (`ESC O B`) when recorded in a bare pty. Note Alt+letter keys are TDSR's, so fp menus are reached with F10 in the fixtures. `RUST_LOG=trace` shows every span's score.
 
 **Speech System** (`speech/`):
 - `Synth` trait defines speak/cancel/set_rate/set_volume and two ways to pick a voice: `set_voice_idx(idx)` (a menu index into the backend's current list) and `set_voice(id) -> Result<name>` (a persistent id: espeak voice file, Speech Dispatcher voice name). `voice_count()`/`voice_id(idx)` describe the list (both `None` for index-only backends: macOS server, `speech_command`, SAPI); `legacy_voice_id(idx)` says what an old `voice_idx` meant. **Config:** `[speech] voice = <id>` is what the menu saves and what wins at startup; a bare `voice_idx` is migrated to `voice` on backends with ids (espeak: via the old 14-entry table in `voices::legacy_voice_name`, announced as "voice setting updated to ...") and stays the setting on index-only backends. The menu refuses out-of-range or unusable indices without saving on backends with a list, and saves `voice_idx` regardless of send success on index-only backends (the failure may be a dead speech server). All in `State::apply_configured_voice` and `ConfigHandler::set_voice_idx`.
@@ -138,7 +146,9 @@ Review cursor navigation uses Alt+key:
 - Char: `Alt+m/,/.` (prev/current/next), double-tap `Alt+,` for phonetic
 - Screen: `Alt+U/O` (top/bottom), `Alt+M/>` (start/end of line). `Alt+U` when already on the top row jumps to the oldest scrolled-off line.
 - Scrollback: `Alt+u` from the top row keeps going into lines that scrolled off (`Screen::history`, capped at `MAX_HISTORY` = 2000, recorded only when the main screen's top row scrolls out). `ReviewCursor::above` counts how far above the screen the cursor is; every read goes through `Screen::get_line_at`/`get_char_at`, so word/char review and line copy work there. `Alt+o`/`Alt+O` and cursor tracking bring it back to the screen; `adjust_review_cursor_for_scroll` follows content into the history.
-- Config: `Alt+c` (then a letter; `?` lists keys; Enter or Escape leaves; unknown keys are announced), Copy: `Alt+v`, Quiet: `Alt+q`, Cancel: `Alt+x`. `V` takes a voice index: on success it is saved and "confirmed, <voice name>" is spoken (in the new voice); a rejected index speaks the backend's reason and saves nothing.
+- Config: `Alt+c` (then a letter; `?` lists keys; Enter or Escape leaves; unknown keys are announced), Copy: `Alt+v`, Quiet: `Alt+q`, Cancel: `Alt+x`. `V` takes a voice index: on success it is saved and "confirmed, <voice name>" is spoken (in the new voice); a rejected index speaks the backend's reason and saves nothing. `t` cycles TUI mode.
+- TUI mode: `Alt+t` cycle auto/apps/on/off, `Alt+w` read the current window/dialog, `Alt+h` repeat the highlighted item.
+
 - Numeric entry inside the config menu (rate, volume, voice, delay) accepts digits only, echoes each digit, and Escape or Enter on an empty value cancels
 
 ## Configuration
@@ -151,6 +161,11 @@ rate = 50              # 0-100
 volume = 80            # 0-100
 voice = gmw/en-US      # Linux/WSL: id from `tdsr --list-voices` (menu saves it); macOS/external: voice_idx = N
 cursor_delay = 300     # ms before speaking cursor position
+tui_mode = auto        # auto | apps | on | off: screen diffing for full-screen programs
+
+tui_apps = fp,mc       # process names that always get TUI mode
+tui_settle = 30        # ms of quiet before the screen is compared (max 1000)
+tui_announce = true    # say "TUI mode on/off" when it switches
 speech_command = python3 ~/my_server.py   # optional external speech server
 process_symbols = false
 key_echo = true

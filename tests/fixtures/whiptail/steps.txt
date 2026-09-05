@@ -1,0 +1,7 @@
+# fixture file	keys sent before it (Python bytes literal)
+00_start.bin	None
+01_down_save.bin	b'\x1b[B'
+02_down_quit.bin	b'\x1b[B'
+03_tab_ok.bin	b'\t'
+04_tab_cancel.bin	b'\t'
+05_enter.bin	b'\r'

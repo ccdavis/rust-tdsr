@@ -22,6 +22,7 @@ use log::debug;
 /// - c: toggle cursor tracking
 /// - l: toggle line pause
 /// - s: toggle repeated symbols
+/// - t: cycle TUI mode (auto, apps, on, off)
 /// - ?: list the keys
 /// - Enter or Escape: leave the menu
 ///
@@ -31,7 +32,7 @@ pub struct ConfigHandler;
 /// Spoken on `?` and after an unknown key.
 const CONFIG_HELP: &str = "config keys: r rate, v volume, capital V voice, d delay, \
 p symbols, e character echo, c cursor tracking, l line pause, s repeated symbols, \
-enter or escape to exit";
+t TUI mode, enter or escape to exit";
 
 /// An error's message without the "Speech synthesis error:" prefix, for
 /// speaking.
@@ -353,8 +354,14 @@ impl KeyHandler for ConfigHandler {
         &mut self,
         key: &[u8],
         state: &mut State,
-        _emulator: &mut Emulator,
+        emulator: &mut Emulator,
     ) -> Result<HandlerAction> {
+        // TUI mode needs the screen (switching it on takes a baseline)
+        if key == b"t" {
+            debug!("Config: TUI mode");
+            state.cycle_tui_mode(emulator.screen())?;
+            return Ok(HandlerAction::Handled);
+        }
         self.process_with_state(key, state)
     }
 }

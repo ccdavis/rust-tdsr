@@ -20,6 +20,7 @@ use tdsr::input::{
 use tdsr::platform::is_wsl;
 use tdsr::state::State;
 use tdsr::terminal::{get_terminal_size, restore_termios, set_raw_mode, Emulator, Pty};
+use tdsr::tui::{process_name, Foreground, KeyKind};
 use tdsr::Result;
 
 /// Token for stdin in mio poll
@@ -217,6 +218,7 @@ fn run() -> Result<i32> {
     // Create PTY and spawn shell
     // This is the core of the screen reader - we sit between user and shell
     let mut pty = Pty::new(program, rows, cols, Some(&original_termios))?;
+    let mut fg_cache = ForegroundCache::default();
     info!("PTY created, shell spawned");
 
     // Create terminal emulator
@@ -358,7 +360,13 @@ fn run() -> Result<i32> {
                         pty_event = true;
                         // WSL keeps its original one-read-per-readiness cadence
                         // (see the drain note in handle_pty_output).
-                        if !handle_pty_output(&mut pty, &mut emulator, &mut state, false)? {
+                        if !handle_pty_output(
+                            &mut pty,
+                            &mut emulator,
+                            &mut state,
+                            false,
+                            &mut fg_cache,
+                        )? {
                             info!("PTY closed (shell exited)");
                             break 'main;
                         }
@@ -399,7 +407,13 @@ fn run() -> Result<i32> {
                     }
                     PTY => {
                         pty_event = true;
-                        if !handle_pty_output(&mut pty, &mut emulator, &mut state, true)? {
+                        if !handle_pty_output(
+                            &mut pty,
+                            &mut emulator,
+                            &mut state,
+                            true,
+                            &mut fg_cache,
+                        )? {
                             info!("PTY closed (shell exited)");
                             break 'main;
                         }
@@ -468,6 +482,7 @@ fn handle_stdin(
             pty.write(key)?;
             continue;
         }
+        state.last_key_kind = Some(KeyKind::of(key));
         match dispatch_key(key, state, emulator, default_handler) {
             Ok(true) => {
                 track_typed_key(state, key);
@@ -540,6 +555,7 @@ fn handle_pty_output(
     emulator: &mut Emulator,
     state: &mut State,
     drain: bool,
+    fg_cache: &mut ForegroundCache,
 ) -> Result<bool> {
     /// Upper bound on bytes handled per event, so a flood can't starve the
     /// keyboard for long (the loop comes straight back for the rest).
@@ -550,6 +566,7 @@ fn handle_pty_output(
 
     // Save cursor position before processing
     let old_cursor = emulator.cursor();
+    let mut echoed_any = None;
 
     loop {
         let n = match pty.read(&mut buf) {
@@ -580,6 +597,7 @@ fn handle_pty_output(
             &mut state.last_key,
         )?;
         if let Some(ch) = echoed {
+            echoed_any = Some(ch);
             if state.config.key_echo() {
                 state.speak_char(ch)?;
             }
@@ -590,13 +608,14 @@ fn handle_pty_output(
         }
     }
 
-    if state.quiet || state.temp_silence {
-        // Not reading automatically right now: keep the screen, drop the text
-        state.speech_buffer.drain_lines();
-        state.speech_buffer.flush();
-    } else if state.speech_buffer.has_pending_lines() || !state.speech_buffer.is_empty() {
-        state.schedule_speech_flush();
-    }
+    // Speak the text, or in TUI mode schedule the screen comparison
+    let foreground = foreground(pty, fg_cache);
+    state.after_output(
+        emulator.screen(),
+        old_cursor,
+        echoed_any,
+        foreground.as_ref(),
+    )?;
 
     // Adjust review cursor for any scrolling that occurred
     let scroll_offset = emulator.screen_mut().take_scroll_offset();
@@ -605,13 +624,46 @@ fn handle_pty_output(
         state.adjust_review_cursor_for_scroll(scroll_offset, screen.size.1, screen.history_len());
     }
 
-    // Update review cursor if cursor tracking is enabled and cursor moved
+    // Update review cursor if cursor tracking is enabled and cursor moved.
+    // A full-screen program that hides the cursor parks it anywhere; the
+    // review cursor then follows the highlight instead.
     let new_cursor = emulator.cursor();
-    if old_cursor != new_cursor {
+    let cursor_meaningful = !(state.tui.active() && !emulator.screen().cursor_visible);
+    if old_cursor != new_cursor && cursor_meaningful {
         state.update_review_cursor_from_terminal(new_cursor);
     }
 
     Ok(true)
+}
+
+/// The PTY's foreground process, cached by process group so the name is
+/// looked up only when it changes
+#[derive(Default)]
+struct ForegroundCache {
+    pgid: Option<i32>,
+    foreground: Option<Foreground>,
+}
+
+fn foreground(pty: &Pty, cache: &mut ForegroundCache) -> Option<Foreground> {
+    let pgid = pty.foreground_pgid()?;
+    if cache.pgid != Some(pgid) {
+        // With a shell in the PTY, its own process group in the foreground
+        // means no program is running. A program run directly has no shell
+        // to compare with.
+        let is_shell = if pty.child_is_shell() {
+            pty.child_pid().map(|pid| pid as i32 == pgid)
+        } else {
+            None
+        };
+        let name = process_name(pgid);
+        debug!(
+            "Foreground process group {} ({:?}), shell: {:?}",
+            pgid, name, is_shell
+        );
+        cache.pgid = Some(pgid);
+        cache.foreground = Some(Foreground { is_shell, name });
+    }
+    cache.foreground.clone()
 }
 
 /// RAII guard to restore terminal on exit

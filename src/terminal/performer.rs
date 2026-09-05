@@ -121,9 +121,26 @@ impl<'a> ScreenPerformer<'a> {
             // CSI ?1049l / ?47l / ?1047l - Restore from alternate screen
             (1049 | 47 | 1047, 'l') => {
                 trace!("Leaving alternate screen mode ({})", mode);
+                let was_alt = self.screen.in_alt_screen;
                 self.screen.restore_screen();
+                // Text drawn on the alternate screen just before it went
+                // away (a dialog's last repaint) belongs to a screen that
+                // no longer exists; what follows is what matters.
+                if was_alt {
+                    self.speech_buffer.drain_lines();
+                    self.speech_buffer.flush();
+                }
                 self.speech_buffer.begin_row();
             }
+            // CSI ?7 h/l - auto-wrap (DECAWM)
+            (7, 'h') => self.screen.autowrap = true,
+            (7, 'l') => {
+                self.screen.autowrap = false;
+                self.screen.pending_wrap = false;
+            }
+            // CSI ?25 h/l - text cursor visibility (DECTCEM)
+            (25, 'h') => self.screen.cursor_visible = true,
+            (25, 'l') => self.screen.cursor_visible = false,
             _ => {
                 trace!("Unhandled private mode: ?{}{}", mode, action);
             }
@@ -142,7 +159,8 @@ impl<'a> Perform for ScreenPerformer<'a> {
     /// last column leaves the cursor there with `pending_wrap` set; the next
     /// character wraps to the start of the following line first, scrolling
     /// the region when already at its bottom. A wide character that doesn't
-    /// fit in the remaining columns wraps too.
+    /// fit in the remaining columns wraps too. With auto-wrap off the last
+    /// column is simply overwritten.
     fn print(&mut self, c: char) {
         let (cols, rows) = self.screen.size;
         if cols == 0 || rows == 0 {
@@ -162,7 +180,11 @@ impl<'a> Perform for ScreenPerformer<'a> {
         let c = self.screen.map_charset(c);
 
         let mut wrapped = false;
-        if self.screen.pending_wrap || self.screen.cursor.0 + width > cols {
+        if !self.screen.autowrap {
+            if self.screen.cursor.0 + width > cols {
+                self.screen.cursor.0 = cols.saturating_sub(width);
+            }
+        } else if self.screen.pending_wrap || self.screen.cursor.0 + width > cols {
             self.screen.pending_wrap = false;
             self.screen.cursor.0 = 0;
             self.linefeed();
@@ -222,11 +244,13 @@ impl<'a> Perform for ScreenPerformer<'a> {
             self.speech_buffer.apply_overwrite();
         }
 
-        // Write character to screen buffer
+        // Write character to screen buffer with the current rendition
+        let attrs = self.screen.sgr;
         if let Some(row) = self.screen.buffer.get_mut(y as usize) {
             if let Some(cell) = row.get_mut(x as usize) {
                 cell.data = c;
                 cell.is_wide_continuation = false;
+                cell.attrs = attrs;
             }
 
             // For wide characters, mark the next cell as a continuation
@@ -234,6 +258,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
             if width > 1 {
                 if let Some(next_cell) = row.get_mut((x + 1) as usize) {
                     *next_cell = Cell::wide_continuation();
+                    next_cell.attrs = attrs;
                 }
             }
         }
@@ -250,11 +275,12 @@ impl<'a> Perform for ScreenPerformer<'a> {
             self.speech_buffer.push(c);
         }
 
-        // Advance the cursor; in the last column it stays put with a wrap pending
+        // Advance the cursor; in the last column it stays put with a wrap
+        // pending (or, with auto-wrap off, simply stays)
         let next_x = x + width;
         if next_x >= cols {
             self.screen.cursor.0 = cols - 1;
-            self.screen.pending_wrap = true;
+            self.screen.pending_wrap = self.screen.autowrap;
         } else {
             self.screen.cursor.0 = next_x;
         }
@@ -402,19 +428,21 @@ impl<'a> Perform for ScreenPerformer<'a> {
                 }
             }
             'K' => {
-                // Erase line
+                // Erase line (blanks keep the current background)
                 self.screen.pending_wrap = false;
                 let mode = param(params, 0, 0);
+                let erase = self.screen.sgr.erase_attrs();
                 if let Some(row) = self.screen.buffer.get_mut(y as usize) {
-                    match mode {
+                    let cells: &mut dyn Iterator<Item = &mut Cell> = match mode {
                         // Clear to end of line
-                        0 => row.iter_mut().skip(x as usize).for_each(Cell::clear),
+                        0 => &mut row.iter_mut().skip(x as usize),
                         // Clear to start of line
-                        1 => row.iter_mut().take(x as usize + 1).for_each(Cell::clear),
+                        1 => &mut row.iter_mut().take(x as usize + 1),
                         // Clear entire line
-                        2 => row.iter_mut().for_each(Cell::clear),
-                        _ => {}
-                    }
+                        2 => &mut row.iter_mut(),
+                        _ => &mut std::iter::empty(),
+                    };
+                    cells.for_each(|cell| cell.clear_with(erase));
                 }
             }
             // Erase characters in place (ECH) - used heavily by ncurses and zsh
@@ -450,6 +478,9 @@ impl<'a> Perform for ScreenPerformer<'a> {
                 self.screen.set_scroll_region(top, bottom);
                 self.cursor_moved();
             }
+
+            // Select graphic rendition: colours and styles for what follows
+            'm' => self.screen.sgr.apply_sgr(params.iter()),
 
             _ => {
                 trace!("Unhandled CSI: {} with {:?}", action, params);
@@ -1340,5 +1371,117 @@ mod tests {
         assert_eq!(screen.scroll_region, None);
         assert!(!screen.in_alt_screen);
         assert_eq!(screen.get_line_trimmed(0), "");
+    }
+
+    // ========== Attributes (SGR), erase colours, DECTCEM, DECAWM ==========
+
+    use super::super::attrs::{Attrs, Color};
+
+    fn attrs_at(screen: &Screen, x: u16, y: u16) -> Attrs {
+        screen.buffer[y as usize][x as usize].attrs
+    }
+
+    #[test]
+    fn test_sgr_is_stamped_on_printed_cells() {
+        let (screen, _) = run_bytes(10, 2, false, b"\x1b[30;42mab\x1b[0mc\x1b[97;1md");
+        let green = Attrs {
+            fg: Color::Indexed(0),
+            bg: Color::Indexed(2),
+            ..Attrs::default()
+        };
+        assert_eq!(attrs_at(&screen, 0, 0), green);
+        assert_eq!(attrs_at(&screen, 1, 0), green);
+        assert_eq!(attrs_at(&screen, 2, 0), Attrs::default());
+        let bright = attrs_at(&screen, 3, 0);
+        assert_eq!(bright.fg, Color::Indexed(15));
+        assert!(bright.bold && bright.is_bright_fg());
+        assert_eq!(screen.get_line_trimmed(0), "abcd");
+    }
+
+    #[test]
+    fn test_sgr_extended_colours_through_parser() {
+        let (screen, _) = run_bytes(
+            10,
+            1,
+            false,
+            b"\x1b[38;5;208;48;2;1;2;3ma\x1b[0;38:2::9:8:7mb",
+        );
+        assert_eq!(attrs_at(&screen, 0, 0).fg, Color::Indexed(208));
+        assert_eq!(attrs_at(&screen, 0, 0).bg, Color::Rgb(1, 2, 3));
+        assert_eq!(attrs_at(&screen, 1, 0).fg, Color::Rgb(9, 8, 7));
+        assert_eq!(attrs_at(&screen, 1, 0).bg, Color::Default);
+    }
+
+    #[test]
+    fn test_wide_char_continuation_carries_attrs() {
+        let (screen, _) = run_bytes(10, 1, false, "\x1b[44m日".as_bytes());
+        assert_eq!(attrs_at(&screen, 0, 0).bg, Color::Indexed(4));
+        assert!(screen.buffer[0][1].is_wide_continuation);
+        assert_eq!(attrs_at(&screen, 1, 0).bg, Color::Indexed(4));
+    }
+
+    #[test]
+    fn test_erase_keeps_background_colour() {
+        // ED 2 with a blue background: every cell blank but blue (bce)
+        let (screen, _) = run_bytes(4, 2, false, b"\x1b[1;31;44m\x1b[2J");
+        for y in 0..2 {
+            for x in 0..4 {
+                let a = attrs_at(&screen, x, y);
+                assert_eq!(a.bg, Color::Indexed(4));
+                assert_eq!(a.fg, Color::Default);
+                assert!(!a.bold);
+                assert_eq!(screen.get_char(x, y), Some(' '));
+            }
+        }
+        // EL 0 from column 2, ECH, and the row scrolled in take the colour too
+        let (screen, _) = run_bytes(4, 2, false, b"abcd\x1b[1;3H\x1b[42m\x1b[K\x1b[1;1H\x1b[1X");
+        assert_eq!(attrs_at(&screen, 0, 0).bg, Color::Indexed(2));
+        assert_eq!(attrs_at(&screen, 1, 0).bg, Color::Default);
+        assert_eq!(attrs_at(&screen, 2, 0).bg, Color::Indexed(2));
+        assert_eq!(attrs_at(&screen, 3, 0).bg, Color::Indexed(2));
+        let (screen, _) = run_bytes(4, 2, false, b"\x1b[45m\r\n\r\n");
+        assert_eq!(attrs_at(&screen, 0, 1).bg, Color::Indexed(5));
+        // Reverse video erases with the foreground as background
+        let (screen, _) = run_bytes(4, 1, false, b"\x1b[7;33m\x1b[2K");
+        assert_eq!(attrs_at(&screen, 0, 0).bg, Color::Indexed(3));
+    }
+
+    #[test]
+    fn test_ris_resets_rendition() {
+        let (screen, _) = run_bytes(4, 1, false, b"\x1b[44m\x1b[?25l\x1b[?7l\x1bcx");
+        assert_eq!(attrs_at(&screen, 0, 0), Attrs::default());
+        assert!(screen.cursor_visible);
+        assert!(screen.autowrap);
+    }
+
+    #[test]
+    fn test_dectcem_tracks_cursor_visibility() {
+        let (screen, _) = run_bytes(4, 1, false, b"\x1b[?25l");
+        assert!(!screen.cursor_visible);
+        let (screen, _) = run_bytes(4, 1, false, b"\x1b[?25l\x1b[?12l\x1b[?25h");
+        assert!(screen.cursor_visible);
+    }
+
+    #[test]
+    fn test_autowrap_off_overwrites_last_column() {
+        let (screen, _) = run_bytes(5, 2, false, b"\x1b[?7labcdefg");
+        assert_eq!(screen.get_line_trimmed(0), "abcdg");
+        assert_eq!(screen.get_line_trimmed(1), "");
+        assert_eq!(screen.cursor, (4, 0));
+        assert!(!screen.pending_wrap);
+        // A wide character that doesn't fit is drawn in the last two columns
+        let (screen, _) = run_bytes(5, 2, false, "\x1b[?7labcd日".as_bytes());
+        assert_eq!(screen.get_line_trimmed(0), "abc日");
+        assert_eq!(screen.cursor, (4, 0));
+        // Turning it back on restores wrapping
+        let (screen, _) = run_bytes(5, 2, false, b"\x1b[?7l\x1b[?7habcdefg");
+        assert_eq!(screen.get_line_trimmed(1), "fg");
+    }
+
+    #[test]
+    fn test_autowrap_off_cancels_pending_wrap() {
+        let (screen, _) = run_bytes(5, 2, false, b"abcde\x1b[?7lX");
+        assert_eq!(screen.get_line_trimmed(0), "abcdX");
+        assert_eq!(screen.get_line_trimmed(1), "");
     }
 }

@@ -270,10 +270,31 @@ impl DefaultKeyHandler {
                 Ok(HandlerAction::Handled)
             }
 
+            // TUI mode: cycle auto/apps/on/off, read the window, repeat the highlight
+            TuiModeCycle => {
+                let mode = state.cycle_tui_mode(emulator.screen())?;
+                debug!("TUI mode: {}", mode);
+                Ok(HandlerAction::Handled)
+            }
+
+            TuiReadWindow => {
+                debug!("Read window");
+                state.read_window(emulator.screen())?;
+                Ok(HandlerAction::Handled)
+            }
+
+            TuiRepeatHighlight => {
+                debug!("Repeat highlight");
+                state.repeat_highlight()?;
+                Ok(HandlerAction::Handled)
+            }
+
             // Arrow keys - pass through but schedule delayed speech
             ArrowUp => {
                 debug!("Arrow up");
-                if state.config.cursor_tracking() {
+                // In TUI mode the tracker reads where the cursor went once
+                // the screen has settled (and ignores it while it is hidden)
+                if state.config.cursor_tracking() && !state.tui.active() {
                     let delay = Duration::from_secs_f32(state.config.cursor_delay());
                     state.schedule(
                         delay,
@@ -289,7 +310,9 @@ impl DefaultKeyHandler {
 
             ArrowDown => {
                 debug!("Arrow down");
-                if state.config.cursor_tracking() {
+                // In TUI mode the tracker reads where the cursor went once
+                // the screen has settled (and ignores it while it is hidden)
+                if state.config.cursor_tracking() && !state.tui.active() {
                     let delay = Duration::from_secs_f32(state.config.cursor_delay());
                     state.schedule(
                         delay,
@@ -305,7 +328,9 @@ impl DefaultKeyHandler {
 
             ArrowLeft => {
                 debug!("Arrow left");
-                if state.config.cursor_tracking() {
+                // In TUI mode the tracker reads where the cursor went once
+                // the screen has settled (and ignores it while it is hidden)
+                if state.config.cursor_tracking() && !state.tui.active() {
                     let delay = Duration::from_secs_f32(state.config.cursor_delay());
                     state.schedule(
                         delay,
@@ -321,7 +346,9 @@ impl DefaultKeyHandler {
 
             ArrowRight => {
                 debug!("Arrow right");
-                if state.config.cursor_tracking() {
+                // In TUI mode the tracker reads where the cursor went once
+                // the screen has settled (and ignores it while it is hidden)
+                if state.config.cursor_tracking() && !state.tui.active() {
                     let delay = Duration::from_secs_f32(state.config.cursor_delay());
                     state.schedule(
                         delay,

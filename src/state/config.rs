@@ -106,7 +106,10 @@ impl Config {
             .set("line_pause", "true")
             .set("repeated_symbols", "false")
             .set("repeated_symbols_values", "-=!#")
-            .set("prompt", ".*");
+            .set("prompt", ".*")
+            .set("tui_mode", "auto")
+            .set("tui_apps", "fp,mc")
+            .set("tui_settle", "30");
 
         ini.with_section(Some("symbols"))
             .set("32", "space")
@@ -353,5 +356,37 @@ impl Config {
         // Config stores milliseconds, convert to seconds for internal use
         let ms = self.get_float("speech", "cursor_delay", 20.0);
         ms / 1000.0
+    }
+
+    /// How TUI mode (screen diffing for full-screen programs) is engaged:
+    /// `auto` (detected), `apps` (listed names only), `on` or `off`.
+    /// Unknown values mean auto.
+    pub fn tui_mode(&self) -> crate::tui::TuiMode {
+        self.get_string("speech", "tui_mode", "auto")
+            .parse()
+            .unwrap_or_default()
+    }
+
+    /// Programs (by process name, comma separated) that always get TUI
+    /// mode when they are in the foreground
+    pub fn tui_apps(&self) -> Vec<String> {
+        self.get_string("speech", "tui_apps", "fp,mc")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    /// Milliseconds of quiet after output before the screen is compared
+    /// with its previous state in TUI mode (full-screen programs paint in
+    /// several writes)
+    pub fn tui_settle_ms(&self) -> u64 {
+        self.get_int("speech", "tui_settle", 30).clamp(0, 1000) as u64
+    }
+
+    /// Whether switching TUI mode on or off is announced
+    pub fn tui_announce(&self) -> bool {
+        self.get_bool("speech", "tui_announce", true)
     }
 }

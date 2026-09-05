@@ -1,5 +1,6 @@
 //! Terminal emulation and PTY management
 
+pub mod attrs;
 pub mod cell;
 pub mod emulator;
 mod performer;
@@ -7,6 +8,7 @@ pub mod pty;
 pub mod screen;
 pub mod util;
 
+pub use attrs::{Attrs, Color};
 pub use cell::Cell;
 pub use emulator::Emulator;
 pub use pty::Pty;

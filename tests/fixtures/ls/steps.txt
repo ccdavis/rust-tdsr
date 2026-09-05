@@ -1,0 +1,2 @@
+# fixture file	keys sent before it (Python bytes literal)
+00_start.bin	None

@@ -72,3 +72,35 @@ fn test_out_of_range_values_are_ignored() {
     assert_eq!(config.rate(), None);
     assert_eq!(config.volume(), None);
 }
+
+#[test]
+fn test_tui_settings_defaults_and_parsing() {
+    use tdsr::tui::TuiMode;
+
+    let (_dir, path) = temp_config();
+    let config = Config::load_from(path).unwrap();
+    assert_eq!(config.tui_mode(), TuiMode::Auto);
+    assert_eq!(config.tui_apps(), vec!["fp".to_string(), "mc".to_string()]);
+    assert_eq!(config.tui_settle_ms(), 30);
+    assert!(config.tui_announce());
+
+    let (_dir, path) = temp_config();
+    std::fs::write(
+        &path,
+        "[speech]\ntui_mode = ON\ntui_apps = mc, dialog ,\ntui_settle = 5000\ntui_announce = false\n",
+    )
+    .unwrap();
+    let config = Config::load_from(path).unwrap();
+    assert_eq!(config.tui_mode(), TuiMode::On);
+    assert_eq!(
+        config.tui_apps(),
+        vec!["mc".to_string(), "dialog".to_string()]
+    );
+    assert_eq!(config.tui_settle_ms(), 1000, "settle time is capped");
+    assert!(!config.tui_announce());
+
+    let (_dir, path) = temp_config();
+    std::fs::write(&path, "[speech]\ntui_mode = sometimes\n").unwrap();
+    let config = Config::load_from(path).unwrap();
+    assert_eq!(config.tui_mode(), TuiMode::Auto, "unknown values mean auto");
+}

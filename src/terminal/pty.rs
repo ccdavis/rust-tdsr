@@ -27,6 +27,11 @@ pub struct Pty {
     /// The child process (shell) running in the PTY
     child: Box<dyn Child + Send>,
 
+    /// Whether the child is the user's shell (no program was given), so
+    /// its process group being in the foreground means "no program is
+    /// running"
+    child_is_shell: bool,
+
     /// Duplicated file descriptor for the PTY (for event loop registration)
     /// This is our own copy that stays valid even after master is consumed
     _fd_owner: OwnedFd,
@@ -55,6 +60,7 @@ impl Pty {
         termios: Option<&libc::termios>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
+        let child_is_shell = program.is_none();
 
         let size = PtySize {
             rows,
@@ -142,10 +148,29 @@ impl Pty {
             reader,
             writer,
             child,
+            child_is_shell,
             _fd_owner: fd_owner,
             fd,
             _size: size,
         })
+    }
+
+    /// Process group in the foreground of the PTY (the program the user is
+    /// interacting with), when the terminal reports one
+    pub fn foreground_pgid(&self) -> Option<i32> {
+        let pgid = unsafe { libc::tcgetpgrp(self.fd) };
+        (pgid > 0).then_some(pgid)
+    }
+
+    /// Process id of the child (shell or program) running in the PTY
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
+    /// Whether the child is the user's shell rather than a program TDSR
+    /// was asked to run
+    pub fn child_is_shell(&self) -> bool {
+        self.child_is_shell
     }
 
     /// Get the file descriptor for the PTY master

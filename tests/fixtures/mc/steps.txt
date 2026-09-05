@@ -1,0 +1,16 @@
+# fixture file	keys sent before it (Python bytes literal)
+00_start.bin	None
+01_down.bin	b'\x1bOB'
+02_down_again.bin	b'\x1bOB'
+03_tab_other_panel.bin	b'\t'
+04_down_other_panel.bin	b'\x1bOB'
+05_tab_back.bin	b'\t'
+06_f9_menu.bin	b'\x1b[20~'
+07_right_menu.bin	b'\x1bOC'
+08_down_open_menu.bin	b'\x1bOB'
+09_down_next_item.bin	b'\x1bOB'
+10_escape_close_menu.bin	[(b'\x1b', 0.3), (b'\x1b', 0.0)]
+11_end_last_file.bin	b'\x1bOF'
+12_f3_view.bin	b'\x1bOR'
+13_f3_close_view.bin	b'\x1bOR'
+14_f10_quit.bin	b'\x1b[21~'

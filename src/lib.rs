@@ -13,6 +13,7 @@ pub mod speech;
 pub mod state;
 pub mod symbols;
 pub mod terminal;
+pub mod tui;
 
 pub use error::{Result, TdsrError};
 

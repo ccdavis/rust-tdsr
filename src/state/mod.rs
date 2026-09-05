@@ -11,6 +11,7 @@ use crate::plugins::PluginManager;
 use crate::review::ReviewCursor;
 use crate::speech::{SpeechBuffer, Synth};
 use crate::terminal::Screen;
+use crate::tui::{Announcement, Foreground, KeyKind, ObserveCtx, TuiMode, TuiTracker};
 use crate::{Result, TdsrError};
 use config::Config;
 use log::{info, warn};
@@ -99,7 +100,34 @@ pub struct State {
 
     /// Number of plugins currently running
     plugins_running: usize,
+
+    /// TUI mode: screen diffing for full-screen programs (menus, dialogs)
+    pub tui: TuiTracker,
+
+    /// Screen comparison waiting for the output of a keystroke to settle
+    tui_flush: Option<TuiFlush>,
+
+    /// What kind of key the user pressed last (typed character, arrow,
+    /// Tab...), for the TUI tracker
+    pub last_key_kind: Option<KeyKind>,
 }
+
+/// A pending TUI-mode screen comparison
+struct TuiFlush {
+    /// When the first burst of this batch arrived
+    first: Instant,
+    /// When to compare
+    due: Instant,
+    /// Cursor position before the first burst
+    cursor_before: (u16, u16),
+    /// A typed character echoed during the batch
+    echoed: Option<char>,
+    /// The key that caused the output
+    key: Option<KeyKind>,
+}
+
+/// Longest a TUI comparison is deferred while output keeps coming
+const TUI_MAX_SETTLE: Duration = Duration::from_millis(150);
 
 impl State {
     /// Create a new application state with given terminal dimensions
@@ -182,6 +210,7 @@ impl State {
         };
 
         let (tx, rx) = mpsc::channel();
+        let tui = TuiTracker::new(config.tui_mode(), config.tui_apps());
         let mut state = Self {
             config,
             review: ReviewCursor::new(cols, rows),
@@ -201,6 +230,9 @@ impl State {
             plugin_results: rx,
             plugin_sender: tx,
             plugins_running: 0,
+            tui,
+            tui_flush: None,
+            last_key_kind: None,
         };
         if let Some(msg) = startup_warning {
             state.speak(&msg)?;
@@ -401,6 +433,171 @@ impl State {
             },
             false,
         );
+    }
+
+    // ========== TUI mode ==========
+
+    /// Bookkeeping after a burst of terminal output, deciding how it is
+    /// spoken. In TUI mode the printed text is discarded and a screen
+    /// comparison is scheduled for when the output has settled; otherwise
+    /// the buffered text is spoken (or dropped while quiet).
+    pub fn after_output(
+        &mut self,
+        screen: &Screen,
+        cursor_before: (u16, u16),
+        echoed: Option<char>,
+        foreground: Option<&Foreground>,
+    ) -> Result<()> {
+        if let Some(change) = self.tui.note_output(screen, foreground) {
+            self.speak_announcement(screen, change)?;
+        }
+        if self.tui.active() {
+            self.speech_buffer.drain_lines();
+            self.speech_buffer.flush();
+            let now = Instant::now();
+            let settle = Duration::from_millis(self.config.tui_settle_ms());
+            match &mut self.tui_flush {
+                Some(flush) => {
+                    flush.due = (now + settle).min(flush.first + TUI_MAX_SETTLE);
+                    flush.echoed = flush.echoed.or(echoed);
+                }
+                None => {
+                    self.tui_flush = Some(TuiFlush {
+                        first: now,
+                        due: now + settle,
+                        cursor_before,
+                        echoed,
+                        key: self.last_key_kind,
+                    })
+                }
+            }
+            return Ok(());
+        }
+        self.tui_flush = None;
+        if self.quiet || self.temp_silence {
+            // Not reading automatically right now: keep the screen, drop the text
+            self.speech_buffer.drain_lines();
+            self.speech_buffer.flush();
+        } else if self.speech_buffer.has_pending_lines() || !self.speech_buffer.is_empty() {
+            self.schedule_speech_flush();
+        }
+        Ok(())
+    }
+
+    /// Whether a TUI comparison is waiting
+    pub fn tui_flush_pending(&self) -> bool {
+        self.tui_flush.is_some()
+    }
+
+    /// Compare the screen with its state before the last keystroke's
+    /// output and speak what changed (a highlight, a window, a message,
+    /// the cursor's new line). Runs when the output has settled; tests
+    /// call it directly.
+    pub fn flush_tui(&mut self, screen: &Screen) -> Result<()> {
+        let Some(flush) = self.tui_flush.take() else {
+            return Ok(());
+        };
+        let ctx = ObserveCtx {
+            cursor_before: flush.cursor_before,
+            echoed: flush.echoed,
+            key: flush.key,
+        };
+        let announcements = self.tui.observe(screen, &ctx);
+        if self.quiet {
+            return Ok(());
+        }
+        for announcement in announcements {
+            self.speak_announcement(screen, announcement)?;
+        }
+        Ok(())
+    }
+
+    /// Speak one tracker announcement and move the review cursor to it
+    pub fn speak_announcement(
+        &mut self,
+        screen: &Screen,
+        announcement: Announcement,
+    ) -> Result<()> {
+        match announcement {
+            Announcement::Highlight { text, at } => {
+                self.speak(&text)?;
+                self.review.pos = at;
+                self.review.above = 0;
+            }
+            Announcement::Window {
+                title,
+                lines,
+                focus,
+            } => {
+                match title {
+                    Some(title) => self.speak(&title)?,
+                    None if lines.is_empty() && focus.is_none() => self.speak("window")?,
+                    None => {}
+                }
+                for line in lines {
+                    self.speak_output(&line)?;
+                }
+                if let Some(focus) = focus {
+                    self.speak(&focus)?;
+                }
+            }
+            Announcement::Text { text, at } => {
+                self.speak_output(&text)?;
+                self.review.pos = at;
+                self.review.above = 0;
+            }
+            Announcement::Char { x, y } => {
+                self.review.pos = (x, y);
+                self.review.above = 0;
+                self.say_char(screen, y, x, false)?;
+            }
+            Announcement::ModeChanged(on) => {
+                if self.config.tui_announce() {
+                    self.speak(if on { "TUI mode on" } else { "TUI mode off" })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Step TUI mode to the next setting (auto, on, off), save it and
+    /// announce it
+    pub fn cycle_tui_mode(&mut self, screen: &Screen) -> Result<TuiMode> {
+        let mode = self.tui.cycle_mode(screen);
+        self.tui_flush = None;
+        self.config.set("speech", "tui_mode", mode.as_str());
+        self.save_config()?;
+        let spoken = match mode {
+            TuiMode::Auto => "TUI mode auto".to_string(),
+            other => format!("TUI mode {}", other),
+        };
+        self.speak(&spoken)?;
+        Ok(mode)
+    }
+
+    /// Read the current window or dialog: the frame around the highlight
+    /// (or the cursor), else the last window that opened, else the screen
+    pub fn read_window(&mut self, screen: &Screen) -> Result<()> {
+        let anchor = self
+            .tui
+            .current_highlight()
+            .map(|h| (h.x0, h.row))
+            .unwrap_or(screen.cursor);
+        let window = self.tui.window_at(screen, anchor);
+        self.speak_announcement(screen, window)
+    }
+
+    /// Repeat the highlighted item
+    pub fn repeat_highlight(&mut self) -> Result<()> {
+        match self.tui.current_highlight() {
+            Some(h) => {
+                let text = h.text.clone();
+                self.review.pos = (h.x0, h.row);
+                self.review.above = 0;
+                self.speak(&text)
+            }
+            None => self.speak("no highlight"),
+        }
     }
 
     /// Speak a single character (for key echo)
@@ -852,6 +1049,10 @@ impl State {
         self.delaying_output = false;
         self.speech_buffer.drain_lines();
         self.speech_buffer.flush();
+        // A pending screen comparison is dropped too. Its baseline stays,
+        // so the next comparison covers this output as well: diffing
+        // screens, not streams, loses nothing.
+        self.tui_flush = None;
     }
 
     /// Run any delayed functions that are ready
@@ -877,9 +1078,15 @@ impl State {
         }
 
         // Execute the ready functions
-        let executed = !to_run.is_empty();
+        let mut executed = !to_run.is_empty();
         for (_when, func) in to_run {
             func(self, screen)?;
+        }
+
+        // The TUI comparison, once the output has settled
+        if self.tui_flush.as_ref().is_some_and(|f| now >= f.due) {
+            self.flush_tui(screen)?;
+            executed = true;
         }
 
         Ok(executed)
@@ -890,14 +1097,13 @@ impl State {
     /// Returns None if no functions are scheduled, otherwise duration until next function
     /// Used to set timeout for select/poll
     pub fn time_until_next_scheduled(&self) -> Option<Duration> {
-        if self.delayed_functions.is_empty() {
-            return None;
-        }
-
-        let now = Instant::now();
-        let next = self.delayed_functions.iter().map(|(when, _)| *when).min()?;
-
-        Some(next.saturating_duration_since(now))
+        let next = self
+            .delayed_functions
+            .iter()
+            .map(|(when, _)| *when)
+            .chain(self.tui_flush.as_ref().map(|f| f.due))
+            .min()?;
+        Some(next.saturating_duration_since(Instant::now()))
     }
 
     /// Update review cursor to match terminal cursor

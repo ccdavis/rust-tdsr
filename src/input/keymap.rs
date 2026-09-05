@@ -49,6 +49,14 @@ pub enum KeyAction {
     SelectionStart,
     CopyMode,
     Silence,
+
+    // TUI mode (full-screen programs)
+    /// Cycle TUI mode: auto, on, off
+    TuiModeCycle,
+    /// Read the current window or dialog
+    TuiReadWindow,
+    /// Repeat the highlighted item
+    TuiRepeatHighlight,
 }
 
 /// Create the default keymap
@@ -98,6 +106,11 @@ pub fn create_default_keymap() -> HashMap<KeySequence, KeyAction> {
     map.insert(b"\x1br".to_vec(), KeyAction::SelectionStart);
     map.insert(b"\x1bv".to_vec(), KeyAction::CopyMode);
     map.insert(b"\x1bx".to_vec(), KeyAction::Silence);
+
+    // TUI mode (alt+t cycle, alt+w read window, alt+h repeat highlight)
+    map.insert(b"\x1bt".to_vec(), KeyAction::TuiModeCycle);
+    map.insert(b"\x1bw".to_vec(), KeyAction::TuiReadWindow);
+    map.insert(b"\x1bh".to_vec(), KeyAction::TuiRepeatHighlight);
 
     // Double-tap keys (press twice within timeout)
     // alt+k twice = spell word

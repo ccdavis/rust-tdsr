@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 
-use super::Cell;
+use super::{Attrs, Cell};
 
 /// Most scrolled-off lines kept for the review cursor to read back.
 pub const MAX_HISTORY: usize = 2000;
@@ -108,6 +108,20 @@ pub struct Screen {
     /// Cleared by any explicit cursor movement or erase.
     pub pending_wrap: bool,
 
+    /// Auto-wrap mode (DECAWM, `CSI ?7 h/l`). Off, printing in the last
+    /// column overwrites it instead of wrapping. Full-screen programs turn
+    /// it off so the bottom-right corner can be drawn without scrolling.
+    pub autowrap: bool,
+
+    /// Whether the text cursor is shown (DECTCEM, `CSI ?25 h/l`). Menus and
+    /// list views hide it, which tells the screen reader that cursor
+    /// tracking is meaningless there.
+    pub cursor_visible: bool,
+
+    /// Current rendition (SGR): colours and styles applied to characters
+    /// printed from now on
+    pub sgr: Attrs,
+
     /// Accumulated scroll count since last check
     /// Positive = scrolled up (content moved up, so review cursor should move up to follow)
     /// Used by screen reader to adjust review cursor after processing PTY output
@@ -138,9 +152,18 @@ impl Screen {
             charsets: [Charset::Ascii, Charset::Ascii],
             active_charset: 0,
             pending_wrap: false,
+            autowrap: true,
+            cursor_visible: true,
+            sgr: Attrs::default(),
             scroll_offset: 0,
             history: VecDeque::new(),
         }
+    }
+
+    /// A blank cell as an erase leaves it: default rendition except for the
+    /// current background (back colour erase, as xterm does)
+    pub fn erase_cell(&self) -> Cell {
+        Cell::blank(self.sgr.erase_attrs())
     }
 
     /// Translate a printable character through the active character set.
@@ -319,9 +342,10 @@ impl Screen {
     /// Clear the entire screen
     /// Used by terminal clear commands
     pub fn clear(&mut self) {
+        let erase = self.sgr.erase_attrs();
         for row in &mut self.buffer {
             for cell in row {
-                cell.clear();
+                cell.clear_with(erase);
             }
         }
     }
@@ -329,18 +353,19 @@ impl Screen {
     /// Clear from cursor to end of screen
     pub fn clear_to_end(&mut self) {
         let (x, y) = self.cursor;
+        let erase = self.sgr.erase_attrs();
 
         // Clear rest of current line
         if let Some(row) = self.buffer.get_mut(y as usize) {
             for cell in row.iter_mut().skip(x as usize) {
-                cell.clear();
+                cell.clear_with(erase);
             }
         }
 
         // Clear all lines below
         for row in self.buffer.iter_mut().skip(y as usize + 1) {
             for cell in row {
-                cell.clear();
+                cell.clear_with(erase);
             }
         }
     }
@@ -348,18 +373,19 @@ impl Screen {
     /// Clear from start of screen to cursor
     pub fn clear_to_start(&mut self) {
         let (x, y) = self.cursor;
+        let erase = self.sgr.erase_attrs();
 
         // Clear all lines above
         for row in self.buffer.iter_mut().take(y as usize) {
             for cell in row {
-                cell.clear();
+                cell.clear_with(erase);
             }
         }
 
         // Clear start of current line to cursor
         if let Some(row) = self.buffer.get_mut(y as usize) {
             for cell in row.iter_mut().take(x as usize + 1) {
-                cell.clear();
+                cell.clear_with(erase);
             }
         }
     }
@@ -401,7 +427,7 @@ impl Screen {
             // Clear the bottom line (it now contains the old top line after swaps)
             if bottom < self.buffer.len() {
                 let cols = self.size.0 as usize;
-                self.buffer[bottom] = vec![Cell::new(); cols];
+                self.buffer[bottom] = vec![self.erase_cell(); cols];
             }
 
             // Track scroll for review cursor adjustment
@@ -435,7 +461,7 @@ impl Screen {
             // Clear the top line (it now contains the old bottom line after swaps)
             if top < self.buffer.len() {
                 let cols = self.size.0 as usize;
-                self.buffer[top] = vec![Cell::new(); cols];
+                self.buffer[top] = vec![self.erase_cell(); cols];
             }
 
             // Track scroll for review cursor adjustment (negative = scrolled down)
@@ -466,7 +492,7 @@ impl Screen {
             }
             // Clear the line at cursor position
             if y < self.buffer.len() {
-                self.buffer[y] = vec![Cell::new(); cols];
+                self.buffer[y] = vec![self.erase_cell(); cols];
             }
         }
     }
@@ -494,7 +520,7 @@ impl Screen {
             }
             // Clear the bottom line
             if bottom < self.buffer.len() {
-                self.buffer[bottom] = vec![Cell::new(); cols];
+                self.buffer[bottom] = vec![self.erase_cell(); cols];
             }
         }
     }
@@ -503,6 +529,7 @@ impl Screen {
     /// Characters to the right shift right, rightmost characters are lost
     pub fn insert_chars(&mut self, n: u16) {
         let (x, y) = (self.cursor.0 as usize, self.cursor.1 as usize);
+        let erase = self.erase_cell();
 
         if let Some(row) = self.buffer.get_mut(y) {
             let cols = row.len();
@@ -513,7 +540,7 @@ impl Screen {
                         row.swap(i, i + 1);
                     }
                     // Insert blank at cursor
-                    row[x] = Cell::new();
+                    row[x] = erase.clone();
                 }
             }
         }
@@ -523,9 +550,10 @@ impl Screen {
     /// Unlike DCH nothing shifts; the cells simply become blank.
     pub fn erase_chars(&mut self, n: u16) {
         let (x, y) = (self.cursor.0 as usize, self.cursor.1 as usize);
+        let erase = self.sgr.erase_attrs();
         if let Some(row) = self.buffer.get_mut(y) {
             for cell in row.iter_mut().skip(x).take(n as usize) {
-                cell.clear();
+                cell.clear_with(erase);
             }
         }
     }
@@ -534,6 +562,7 @@ impl Screen {
     /// Characters to the right shift left, blank characters appear at end
     pub fn delete_chars(&mut self, n: u16) {
         let (x, y) = (self.cursor.0 as usize, self.cursor.1 as usize);
+        let erase = self.erase_cell();
 
         if let Some(row) = self.buffer.get_mut(y) {
             let cols = row.len();
@@ -545,7 +574,7 @@ impl Screen {
                     }
                     // Clear the last character
                     if cols > 0 {
-                        row[cols - 1] = Cell::new();
+                        row[cols - 1] = erase.clone();
                     }
                 }
             }
@@ -602,6 +631,9 @@ impl Screen {
     /// Full reset (RIS, `ESC c`): blank screen, cursor home, no scroll
     /// region, no saved state.
     pub fn reset(&mut self) {
+        self.sgr = Attrs::default();
+        self.autowrap = true;
+        self.cursor_visible = true;
         self.clear();
         self.cursor = (0, 0);
         self.scroll_region = None;

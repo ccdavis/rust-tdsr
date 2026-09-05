@@ -37,7 +37,10 @@
 //!   is the client's measured playback delay) is checked every 250 ms; if it
 //!   exceeds [`BACKLOG_LIMIT_MS`] a short silent gap is inserted to bring it
 //!   back down. Ordinary prose never triggers this; pause-free audio does.
-//! - The stream is closed whenever there is nothing to play.
+//! - The stream is closed whenever there is nothing to play, except for a
+//!   short idle window after a typed letter ([`WSL_LETTER_IDLE_CLOSE`]), so
+//!   that typing does not restart the sink for every character.
+
 //!
 //! One more WSL quirk: that sink never resets its pacing clock when it
 //! resumes from suspend (PulseAudio suspends it 5 s after the last stream
@@ -103,10 +106,15 @@ const DEFAULT_VOICE: &str = "en";
 /// answer (loading an MBROLA voice starts `mbrola` and handshakes with it).
 const VOICE_APPLY_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Native Linux only: how long the playback stream stays open after the last
+/// Native Linux: how long the playback stream stays open after the last
 /// sound before it is closed. Closing rewinds the sink there, so it is not
 /// done per pause as on WSL.
 const IDLE_CLOSE: Duration = Duration::from_millis(500);
+
+/// WSL: how long the stream stays open after a typed letter, so that the
+/// next letter continues into it instead of restarting the sink. Silence
+/// sent meanwhile adds to the backlog, so this is short.
+const WSL_LETTER_IDLE_CLOSE: Duration = Duration::from_millis(150);
 
 /// Granularity of cancellable waits.
 const SLEEP_STEP: Duration = Duration::from_millis(10);
@@ -428,6 +436,9 @@ struct Pulse {
     flush: PaSimpleOp,
     free: PaSimpleFree,
     get_latency: PaSimpleGetLatency,
+    /// Playback streams opened so far (for measurements)
+    opens: AtomicU32,
+
     strerror: PaStrerror,
 }
 
@@ -454,6 +465,7 @@ impl Pulse {
                 free: *simple
                     .get::<PaSimpleFree>(b"pa_simple_free\0")
                     .map_err(err)?,
+                opens: AtomicU32::new(0),
                 get_latency: *simple
                     .get::<PaSimpleGetLatency>(b"pa_simple_get_latency\0")
                     .map_err(err)?,
@@ -522,6 +534,7 @@ impl Pulse {
     /// A playback stream with a small server-side buffer that starts playing
     /// as soon as data arrives.
     fn open_playback(self: &Arc<Self>, rate: u32) -> Result<Stream> {
+        self.opens.fetch_add(1, Ordering::Relaxed);
         let attr = PaBufferAttr {
             maxlength: PA_INVALID,
             tlength: rate * 2 * TARGET_BUFFER_MS / 1000,
@@ -727,6 +740,8 @@ struct Player {
     sent_since_check_ms: u32,
     last_warning: Option<Instant>,
     wsl: bool,
+    /// The utterance being played is a single typed character
+    current_is_letter: bool,
 }
 
 impl Player {
@@ -892,7 +907,16 @@ impl Player {
     /// the stream is closed as well (it must not stay open while silent);
     /// on native Linux it stays open for the next utterance and is closed
     /// by `close_idle` once nothing has been queued for a while.
+    ///
+    /// A typed letter is different: its trailing silence is dropped and the
+    /// stream is left open (the loop closes it after a short idle), so the
+    /// letters of someone typing run straight into each other instead of
+    /// each waiting for a play-out, a close and a fresh stream.
     fn finish(&mut self) {
+        if self.current_is_letter {
+            self.pending_silence = 0;
+            return;
+        }
         if !self.flush_silence(true) {
             self.abort();
             return;
@@ -919,6 +943,18 @@ impl Player {
         self.sent_since_check_ms = 0;
         if let Some(s) = self.stream.take() {
             s.flush();
+        }
+    }
+
+    /// The current utterance was cancelled (a keypress). Text is cut off
+    /// at once. A letter's buffered tail (at most the 40 ms the server
+    /// holds) is left to play: cutting it clicks on every keystroke, and
+    /// the next letter simply follows it in the same stream.
+    fn stop_current(&mut self) {
+        if self.current_is_letter {
+            self.pending_silence = 0;
+        } else {
+            self.abort();
         }
     }
 }
@@ -959,7 +995,9 @@ fn audio_thread(shared: Arc<Shared>, ready: mpsc::Sender<InitResult>) {
         sent_since_check_ms: 0,
         last_warning: None,
         wsl: is_wsl(),
+        current_is_letter: false,
     };
+
     // The voice espeak-ng currently has loaded (its default until told
     // otherwise).
     let mut applied_voice = DEFAULT_VOICE.to_string();
@@ -991,10 +1029,18 @@ fn audio_thread(shared: Arc<Shared>, ready: mpsc::Sender<InitResult>) {
                     break Job::Speak(utterance, settings);
                 }
                 if player.stream.is_some() {
+                    // A stream left open after the last utterance (always on
+                    // native Linux; after a typed letter on WSL)
+                    let idle = if player.wsl {
+                        WSL_LETTER_IDLE_CLOSE
+                    } else {
+                        IDLE_CLOSE
+                    };
                     let (guard, timeout) = shared
                         .wake
-                        .wait_timeout(q, IDLE_CLOSE)
+                        .wait_timeout(q, idle)
                         .unwrap_or_else(|e| e.into_inner());
+
                     q = guard;
                     if timeout.timed_out() && q.items.is_empty() && q.voice_request.is_none() {
                         break Job::Idle;
@@ -1036,12 +1082,13 @@ fn audio_thread(shared: Arc<Shared>, ready: mpsc::Sender<InitResult>) {
                     espeak.set_rate(wpm_for_rate(s.rate));
                     espeak.set_volume(s.volume);
                 }
+                player.current_is_letter = utterance.is_letter;
                 PLAYER.with(|p| p.set(&mut player as *mut Player));
                 espeak.synth(&utterance.text, !utterance.is_letter);
                 PLAYER.with(|p| p.set(ptr::null_mut()));
 
                 if player.cancelled() {
-                    player.abort();
+                    player.stop_current();
                 } else {
                     player.finish();
                 }
@@ -1079,6 +1126,10 @@ pub struct EspeakSynth {
     shared: Arc<Shared>,
     voices: VoiceCatalogue,
     audio_thread: Option<thread::JoinHandle<()>>,
+    /// The server connection the audio thread plays through (read by the
+    /// measurement tests)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pulse: Arc<Pulse>,
 }
 
 /// How long `drop` waits for the audio thread to shut the library down.
@@ -1139,9 +1190,10 @@ impl EspeakSynth {
 
         if is_wsl() {
             let ka_shared = Arc::clone(&shared);
+            let ka_pulse = Arc::clone(&pulse);
             if let Err(e) = thread::Builder::new()
                 .name("tdsr-keepalive".to_string())
-                .spawn(move || keepalive_thread(pulse, ka_shared))
+                .spawn(move || keepalive_thread(ka_pulse, ka_shared))
             {
                 warn!("Could not start sink keep-alive thread: {}", e);
             }
@@ -1155,6 +1207,7 @@ impl EspeakSynth {
             shared,
             voices,
             audio_thread: Some(audio_thread),
+            pulse,
         })
     }
 
@@ -1394,6 +1447,127 @@ mod tests {
         }
         // Let the letters play (settings are applied on the audio thread)
         thread::sleep(Duration::from_millis(300));
+        synth.cancel().unwrap();
+    }
+
+    thread_local! {
+        static FIRST_CHUNK: Cell<Option<Instant>> = const { Cell::new(None) };
+        static CHUNKS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    unsafe extern "C" fn timing_callback(wav: *mut i16, count: c_int, _e: *mut c_void) -> c_int {
+        if !wav.is_null() && count > 0 {
+            FIRST_CHUNK.with(|f| {
+                if f.get().is_none() {
+                    f.set(Some(Instant::now()));
+                }
+            });
+            CHUNKS.with(|c| c.set(c.get() + 1));
+        }
+        0
+    }
+
+    /// Prints where the time goes for a typed letter on this machine:
+    /// opening a playback stream, and espeak-ng's time to the first chunk.
+    /// `cargo test --release --lib measure_letter_latency -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn measure_letter_latency() {
+        setup_pulseaudio().unwrap();
+        let pulse = Pulse::load().unwrap();
+        let zeros = vec![0i16; 882];
+        for i in 0..8 {
+            let t0 = Instant::now();
+            let s = pulse.open_playback(OUTPUT_RATE).unwrap();
+            let t1 = Instant::now();
+            s.write(&zeros).unwrap();
+            let t2 = Instant::now();
+            let lat = s.latency_ms();
+            drop(s);
+            let t3 = Instant::now();
+            println!(
+                "stream {}: open {:?}, first write {:?}, latency {:?}, close {:?}",
+                i,
+                t1 - t0,
+                t2 - t1,
+                lat,
+                t3 - t2
+            );
+            thread::sleep(Duration::from_millis(150));
+        }
+        // Keep one open and time writes into a live stream
+        let s = pulse.open_playback(OUTPUT_RATE).unwrap();
+        for i in 0..5 {
+            let t0 = Instant::now();
+            s.write(&zeros).unwrap();
+            println!("live write {}: {:?}", i, t0.elapsed());
+            thread::sleep(Duration::from_millis(100));
+        }
+        drop(s);
+
+        let mut espeak = Espeak::load(timing_callback).unwrap();
+        espeak.set_voice("gmw/en-US");
+        for text in ["a", "b", "k", "hello", "the quick brown fox"] {
+            FIRST_CHUNK.with(|f| f.set(None));
+            CHUNKS.with(|c| c.set(0));
+            let t0 = Instant::now();
+            espeak.synth(text, false);
+            let total = t0.elapsed();
+            let first = FIRST_CHUNK.with(|f| f.get()).map(|t| t - t0);
+            println!(
+                "synth {:?}: first chunk after {:?}, {} chunks, done in {:?}",
+                text,
+                first,
+                CHUNKS.with(|c| c.get()),
+                total
+            );
+        }
+        std::mem::forget(espeak);
+    }
+
+    /// Drives the backend the way the event loop does while the user types
+    /// (every key cancels, then its echo is spoken as a letter) and reports
+    /// how many playback streams that took and how long the last letter
+    /// needed to start. Plays a few seconds of letters.
+    /// `cargo test --release --lib measure_typing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn measure_typing() {
+        let mut synth = match EspeakSynth::new() {
+            Ok(s) => s,
+            Err(e) => {
+                println!("⚠ espeak-ng in-process backend not available: {}", e);
+                return;
+            }
+        };
+        let pulse = Arc::clone(&synth.pulse);
+
+        thread::sleep(Duration::from_millis(300));
+        let before = pulse.opens.load(Ordering::Relaxed);
+        let t0 = Instant::now();
+        for ch in "hello world from tdsr".chars() {
+            synth.cancel().unwrap();
+            synth.letter(&ch.to_string()).unwrap();
+            thread::sleep(Duration::from_millis(120));
+        }
+        thread::sleep(Duration::from_millis(600));
+        let fast = pulse.opens.load(Ordering::Relaxed) - before;
+        println!(
+            "fast typing (120 ms): {} stream opens for 21 letters in {:?}",
+            fast,
+            t0.elapsed()
+        );
+        let before = pulse.opens.load(Ordering::Relaxed);
+        for ch in "slow typing".chars() {
+            synth.cancel().unwrap();
+            synth.letter(&ch.to_string()).unwrap();
+            thread::sleep(Duration::from_millis(400));
+        }
+        thread::sleep(Duration::from_millis(600));
+        println!(
+            "slow typing (400 ms): {} stream opens for 11 letters",
+            pulse.opens.load(Ordering::Relaxed) - before
+        );
         synth.cancel().unwrap();
     }
 }

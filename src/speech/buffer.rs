@@ -23,6 +23,13 @@ pub struct SpeechBuffer {
     /// Set by a carriage return: the next text drawn on this row replaces
     /// the row's queued text. Cleared when the row changes.
     overwrite_pending: bool,
+
+    /// Byte offset where text that merely repainted unchanged screen cells
+    /// began, recorded while a typed key is waiting for its echo. zsh
+    /// backspaces over the word being typed and redraws all of it, so the
+    /// repaint is queued provisionally and dropped once the echo arrives
+    /// (`discard_redraw`); if unrelated output follows instead it is kept.
+    redraw_start: Option<usize>,
 }
 
 impl SpeechBuffer {
@@ -33,6 +40,7 @@ impl SpeechBuffer {
             pending_lines: Vec::new(),
             row_start: 0,
             overwrite_pending: false,
+            redraw_start: None,
         }
     }
 
@@ -73,6 +81,41 @@ impl SpeechBuffer {
         false
     }
 
+    /// The next character pushed repaints a screen cell that already held it,
+    /// while a typed key is waiting for its echo. Remembers where such text
+    /// starts (the first call of a run wins) so it can be dropped later.
+    pub fn note_redraw(&mut self) {
+        if self.redraw_start.is_none() {
+            self.redraw_start = Some(self.buffer.len());
+        }
+    }
+
+    /// Whether a repaint run noted by `note_redraw` is still open.
+    pub fn in_redraw(&self) -> bool {
+        self.redraw_start.is_some()
+    }
+
+    /// The typed key was echoed: the repaint queued since `note_redraw` was
+    /// the shell redrawing the word around it, not new output. Drops it.
+    /// Returns true when something was discarded.
+    pub fn discard_redraw(&mut self) -> bool {
+        let Some(start) = self.redraw_start.take() else {
+            return false;
+        };
+        if start < self.buffer.len() {
+            self.buffer.truncate(start);
+            self.row_start = self.row_start.min(start);
+            return true;
+        }
+        false
+    }
+
+    /// Output changed a cell without echoing the typed key: whatever was
+    /// repainted before it is ordinary output and stays queued.
+    pub fn end_redraw(&mut self) {
+        self.redraw_start = None;
+    }
+
     /// Mark a line break (for line_pause mode)
     ///
     /// When line_pause is enabled, this moves the current buffer
@@ -84,6 +127,7 @@ impl SpeechBuffer {
             self.pending_lines.push(line);
         }
         self.begin_row();
+        self.redraw_start = None;
     }
 
     /// Check if there are pending lines to speak
@@ -105,6 +149,7 @@ impl SpeechBuffer {
     pub fn flush(&mut self) -> String {
         debug!("Flushing speech buffer: {} chars", self.buffer.len());
         self.row_start = 0;
+        self.redraw_start = None;
         std::mem::take(&mut self.buffer)
     }
 
@@ -123,7 +168,9 @@ impl SpeechBuffer {
     /// Used for backspace handling - O(1) operation
     pub fn pop(&mut self) -> Option<char> {
         let c = self.buffer.pop();
-        self.row_start = self.row_start.min(self.buffer.len());
+        let len = self.buffer.len();
+        self.row_start = self.row_start.min(len);
+        self.redraw_start = self.redraw_start.map(|n| n.min(len));
         c
     }
 }
@@ -199,6 +246,36 @@ mod tests {
         assert!(!buffer.apply_overwrite());
         buffer.write("next");
         assert_eq!(buffer.contents(), "donenext");
+    }
+
+    #[test]
+    fn test_redraw_dropped_only_when_echo_follows() {
+        // Echo arrives: the repaint is dropped, earlier text kept
+        let mut buffer = SpeechBuffer::new();
+        buffer.write("prompt");
+        buffer.note_redraw();
+        buffer.write("cd");
+        assert!(buffer.discard_redraw());
+        assert_eq!(buffer.contents(), "prompt");
+        assert!(!buffer.discard_redraw());
+
+        // Unrelated output follows: the repaint is ordinary text
+        let mut buffer = SpeechBuffer::new();
+        buffer.note_redraw();
+        buffer.write("cd");
+        buffer.end_redraw();
+        buffer.write("x");
+        assert!(!buffer.discard_redraw());
+        assert_eq!(buffer.contents(), "cdx");
+
+        // Flushing forgets the marker; a later discard must not touch new text
+        let mut buffer = SpeechBuffer::new();
+        buffer.note_redraw();
+        buffer.write("cd");
+        buffer.flush();
+        buffer.write("new");
+        assert!(!buffer.discard_redraw());
+        assert_eq!(buffer.contents(), "new");
     }
 
     #[test]

@@ -514,7 +514,8 @@ fn handle_pty_output(
 
         // Parse output and update screen buffer + speech buffer. Key echo is
         // detected while drawing: the first character drawn after a keypress
-        // that equals the typed key is the shell echoing it.
+        // that changes a cell and equals the typed key is the shell echoing
+        // it (zsh repaints the whole word around it; see the performer).
         let line_pause = state.config.line_pause();
         let echoed = emulator.process_with_speech(
             output,
@@ -545,8 +546,8 @@ fn handle_pty_output(
     // Adjust review cursor for any scrolling that occurred
     let scroll_offset = emulator.screen_mut().take_scroll_offset();
     if scroll_offset != 0 {
-        let rows = emulator.screen().size.1;
-        state.adjust_review_cursor_for_scroll(scroll_offset, rows);
+        let screen = emulator.screen();
+        state.adjust_review_cursor_for_scroll(scroll_offset, screen.size.1, screen.history_len());
     }
 
     // Update review cursor if cursor tracking is enabled and cursor moved

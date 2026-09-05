@@ -406,22 +406,58 @@ impl State {
     // These methods implement the screen reader's review cursor for
     // navigating and reading screen content independently of the terminal cursor
 
+    /// Character at column `x` of the review cursor's row (screen row or
+    /// scrolled-off line, see `ReviewCursor::above`)
+    fn char_at(&self, screen: &Screen, x: u16) -> Option<char> {
+        screen.get_char_at(self.review.above, x, self.review.pos.1)
+    }
+
     /// Get character at current review cursor position
     fn get_char(&self, screen: &Screen) -> char {
-        screen
-            .get_char(self.review.pos.0, self.review.pos.1)
-            .unwrap_or(' ')
+        self.char_at(screen, self.review.pos.0).unwrap_or(' ')
+    }
+
+    /// Text of the review cursor's row, trailing spaces removed
+    pub fn review_line(&self, screen: &Screen) -> String {
+        screen.get_line_trimmed_at(self.review.above, self.review.pos.1)
+    }
+
+    /// Move the review cursor up one row: onto the previous screen row, or
+    /// from the top row into the scrolled-off history. False at the oldest
+    /// line there is.
+    fn move_up_row(&mut self, screen: &Screen) -> bool {
+        if self.review.pos.1 > 0 {
+            self.review.pos.1 -= 1;
+            true
+        } else if self.review.above < screen.history_len() {
+            self.review.above += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move the review cursor down one row, back out of the history first.
+    /// False on the bottom row of the screen.
+    fn move_down_row(&mut self, screen: &Screen) -> bool {
+        if self.review.above > 0 {
+            self.review.above -= 1;
+            self.review.pos.1 = 0;
+            true
+        } else if self.review.pos.1 + 1 < screen.size.1 {
+            self.review.pos.1 += 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// Move review cursor to previous character (handles line wrapping)
     fn move_prevchar(&mut self, screen: &Screen) {
-        let (x, y) = self.review.pos;
-        if x == 0 {
-            if y == 0 {
-                return; // Already at top-left
+        if self.review.pos.0 == 0 {
+            if self.move_up_row(screen) {
+                self.review.pos.0 = screen.size.0 - 1;
             }
-            self.review.pos.1 -= 1;
-            self.review.pos.0 = screen.size.0 - 1;
         } else {
             self.review.pos.0 -= 1;
         }
@@ -429,14 +465,10 @@ impl State {
 
     /// Move review cursor to next character (handles line wrapping)
     fn move_nextchar(&mut self, screen: &Screen) {
-        let (x, y) = self.review.pos;
-        let (cols, rows) = screen.size;
-        if x == cols - 1 {
-            if y == rows - 1 {
-                return; // Already at bottom-right
+        if self.review.pos.0 == screen.size.0 - 1 {
+            if self.move_down_row(screen) {
+                self.review.pos.0 = 0;
             }
-            self.review.pos.1 += 1;
-            self.review.pos.0 = 0;
         } else {
             self.review.pos.0 += 1;
         }
@@ -450,9 +482,10 @@ impl State {
         }
     }
 
-    /// Say the line at given y position
+    /// Say the line at given y position (a scrolled-off line when the review
+    /// cursor is in the history)
     pub fn say_line(&mut self, screen: &Screen, y: u16) -> Result<()> {
-        let line = screen.get_line_trimmed(y);
+        let line = screen.get_line_trimmed_at(self.review.above, y);
         let text = if line.is_empty() {
             "blank".to_string()
         } else {
@@ -475,10 +508,8 @@ impl State {
 
     /// Move to previous line and speak it
     pub fn prev_line(&mut self, screen: &Screen) -> Result<()> {
-        if self.review.pos.1 == 0 {
+        if !self.move_up_row(screen) {
             self.speak("top")?;
-        } else {
-            self.review.pos.1 -= 1;
         }
         self.say_line(screen, self.review.pos.1)
     }
@@ -490,17 +521,15 @@ impl State {
 
     /// Move to next line and speak it
     pub fn next_line(&mut self, screen: &Screen) -> Result<()> {
-        if self.review.pos.1 >= screen.size.1 - 1 {
+        if !self.move_down_row(screen) {
             self.speak("bottom")?;
-        } else {
-            self.review.pos.1 += 1;
         }
         self.say_line(screen, self.review.pos.1)
     }
 
     /// Say character at given position
     pub fn say_char(&mut self, screen: &Screen, y: u16, x: u16, phonetic: bool) -> Result<()> {
-        let ch = screen.get_char(x, y).unwrap_or(' ');
+        let ch = screen.get_char_at(self.review.above, x, y).unwrap_or(' ');
         if phonetic {
             let lower = ch.to_lowercase().next().unwrap_or(ch);
             if let Some(phonetic_word) = PHONETICS.get(&lower) {
@@ -558,7 +587,7 @@ impl State {
         // Move to beginning of word
         while self.review.pos.0 > 0
             && self.get_char(screen) != ' '
-            && screen.get_char(self.review.pos.0 - 1, self.review.pos.1) != Some(' ')
+            && self.char_at(screen, self.review.pos.0 - 1) != Some(' ')
         {
             self.move_prevchar(screen);
         }
@@ -632,7 +661,7 @@ impl State {
         // Move to beginning of the word we're now on
         while self.review.pos.0 > 0
             && self.get_char(screen) != ' '
-            && screen.get_char(self.review.pos.0 - 1, self.review.pos.1) != Some(' ')
+            && self.char_at(screen, self.review.pos.0 - 1) != Some(' ')
         {
             self.move_prevchar(screen);
         }
@@ -665,14 +694,20 @@ impl State {
         self.say_word(screen, false)
     }
 
-    /// Jump to top of screen
+    /// Jump to top of screen; when already there (or in the history), jump
+    /// to the oldest scrolled-off line instead.
     pub fn top_of_screen(&mut self, screen: &Screen) -> Result<()> {
+        let history = screen.history_len();
+        if (self.review.pos.1 == 0 || self.review.above > 0) && self.review.above < history {
+            self.review.above = history;
+        }
         self.review.pos.1 = 0;
         self.say_line(screen, 0)
     }
 
-    /// Jump to bottom of screen
+    /// Jump to bottom of screen (leaving the history if the cursor was there)
     pub fn bottom_of_screen(&mut self, screen: &Screen) -> Result<()> {
+        self.review.above = 0;
         self.review.pos.1 = screen.size.1 - 1;
         self.say_line(screen, self.review.pos.1)
     }
@@ -817,6 +852,7 @@ impl State {
     pub fn update_review_cursor_from_terminal(&mut self, cursor: (u16, u16)) {
         if self.config.cursor_tracking() {
             self.review.pos = cursor;
+            self.review.above = 0;
         }
     }
 
@@ -827,21 +863,35 @@ impl State {
     ///
     /// scroll_offset: positive = scrolled up (move review cursor up to follow content)
     ///                negative = scrolled down (move review cursor down to follow content)
-    pub fn adjust_review_cursor_for_scroll(&mut self, scroll_offset: i16, rows: u16) {
+    ///
+    /// Content that scrolls off the top is followed into the history (see
+    /// `ReviewCursor::above`), as far as `history_len` lines are kept.
+    pub fn adjust_review_cursor_for_scroll(
+        &mut self,
+        scroll_offset: i16,
+        rows: u16,
+        history_len: usize,
+    ) {
         if scroll_offset == 0 {
             return;
         }
 
         let (x, y) = self.review.pos;
-        let new_y = if scroll_offset > 0 {
+        if scroll_offset > 0 {
             // Content scrolled up - review cursor should move up to follow
-            y.saturating_sub(scroll_offset as u16)
-        } else {
+            let offset = scroll_offset as u16;
+            if self.review.above > 0 {
+                self.review.above = (self.review.above + offset as usize).min(history_len);
+            } else if y >= offset {
+                self.review.pos = (x, y - offset);
+            } else {
+                self.review.above = ((offset - y) as usize).min(history_len);
+                self.review.pos = (x, 0);
+            }
+        } else if self.review.above == 0 {
             // Content scrolled down - review cursor should move down to follow
             let offset = (-scroll_offset) as u16;
-            (y + offset).min(rows.saturating_sub(1))
-        };
-
-        self.review.pos = (x, new_y);
+            self.review.pos = (x, (y + offset).min(rows.saturating_sub(1)));
+        }
     }
 }

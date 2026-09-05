@@ -270,10 +270,14 @@ example = ls.*      # Only run after 'ls' commands (optional)
 - `Alt+.` - Next character
 
 ### Screen Navigation
-- `Alt+U` - Top of screen
+- `Alt+U` - Top of screen (press again to jump to the oldest scrolled-off line)
 - `Alt+O` - Bottom of screen
 - `Alt+M` - Start of line
 - `Alt+>` - End of line
+
+Output that scrolls off the top of the screen is not lost: `Alt+u` keeps
+going up into the scrollback (the last 2000 lines), where line, word and
+character review all work, and `Alt+o` or `Alt+O` come back down.
 
 ### Modes & Actions
 - `Alt+c` - Configuration menu

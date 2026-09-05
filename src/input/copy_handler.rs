@@ -40,8 +40,7 @@ impl CopyHandler {
             // Copy line where review cursor is positioned
             b"l" => {
                 debug!("Copy mode: copy line");
-                let y = state.review.pos.1;
-                let line = emulator.screen().get_line_trimmed(y);
+                let line = state.review_line(emulator.screen());
 
                 // Copy to clipboard
                 if let Err(e) = crate::clipboard::copy_to_clipboard(&line) {

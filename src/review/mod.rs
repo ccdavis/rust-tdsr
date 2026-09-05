@@ -6,8 +6,15 @@
 
 /// Review cursor for navigating terminal content
 pub struct ReviewCursor {
-    /// Current position (x, y)
+    /// Current position (x, y). While `above` is non-zero the row is 0 and
+    /// the cursor is really on a scrolled-off line.
     pub pos: (u16, u16),
+
+    /// How many lines above the top of the screen the cursor is: 0 means it
+    /// is on the screen at `pos`; `n` means it is on the line that scrolled
+    /// off `n` lines ago (`Screen::get_line_at`). Lets the user read output
+    /// that no longer fits on the screen.
+    pub above: usize,
 
     /// Terminal dimensions
     pub bounds: (u16, u16),
@@ -18,6 +25,7 @@ impl ReviewCursor {
     pub fn new(cols: u16, rows: u16) -> Self {
         Self {
             pos: (0, 0),
+            above: 0,
             bounds: (cols, rows),
         }
     }

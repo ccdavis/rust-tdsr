@@ -4,7 +4,12 @@
 //! It maintains a 2D grid of cells that represents what's currently visible
 //! in the terminal, allowing the review cursor to read any position.
 
+use std::collections::VecDeque;
+
 use super::Cell;
+
+/// Most scrolled-off lines kept for the review cursor to read back.
+pub const MAX_HISTORY: usize = 2000;
 
 /// A designatable character set (`ESC ( x` / `ESC ) x`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +112,13 @@ pub struct Screen {
     /// Positive = scrolled up (content moved up, so review cursor should move up to follow)
     /// Used by screen reader to adjust review cursor after processing PTY output
     scroll_offset: i16,
+
+    /// Lines that scrolled off the top of the main screen, oldest first,
+    /// capped at `MAX_HISTORY`. The review cursor can move up into them
+    /// (`ReviewCursor::above`) to read output that no longer fits on screen.
+    /// Not recorded while the alternate screen is active (full-screen apps
+    /// redraw rather than scroll) or when a scroll region excludes the top row.
+    history: VecDeque<Vec<Cell>>,
 }
 
 impl Screen {
@@ -127,6 +139,7 @@ impl Screen {
             active_charset: 0,
             pending_wrap: false,
             scroll_offset: 0,
+            history: VecDeque::new(),
         }
     }
 
@@ -186,10 +199,39 @@ impl Screen {
         std::mem::take(&mut self.scroll_offset)
     }
 
+    /// Number of scrolled-off lines available to read back. Zero while the
+    /// alternate screen is active: the history belongs to the main screen.
+    pub fn history_len(&self) -> usize {
+        if self.in_alt_screen {
+            0
+        } else {
+            self.history.len()
+        }
+    }
+
+    /// A row as the review cursor sees it: `above == 0` is screen row `y`;
+    /// `above == n > 0` is the line that scrolled off `n` lines ago (1 is
+    /// the most recent, just above the top of the screen).
+    fn review_row(&self, above: usize, y: u16) -> Option<&[Cell]> {
+        if above == 0 {
+            self.buffer.get(y as usize).map(Vec::as_slice)
+        } else if above <= self.history_len() {
+            self.history
+                .get(self.history.len() - above)
+                .map(Vec::as_slice)
+        } else {
+            None
+        }
+    }
+
     /// Get character at position for screen reader to speak
     pub fn get_char(&self, x: u16, y: u16) -> Option<char> {
-        self.buffer
-            .get(y as usize)
+        self.get_char_at(0, x, y)
+    }
+
+    /// Character at `x` on the row `review_row(above, y)` selects
+    pub fn get_char_at(&self, above: usize, x: u16, y: u16) -> Option<char> {
+        self.review_row(above, y)
             .and_then(|row| row.get(x as usize))
             .map(|cell| cell.data)
     }
@@ -198,19 +240,29 @@ impl Screen {
     /// Wide-character continuation cells are skipped so the text carries no
     /// NUL bytes.
     pub fn get_line(&self, y: u16) -> String {
-        if let Some(row) = self.buffer.get(y as usize) {
-            row.iter()
+        self.get_line_at(0, y)
+    }
+
+    /// Text of the row `review_row(above, y)` selects (see `get_line`)
+    pub fn get_line_at(&self, above: usize, y: u16) -> String {
+        match self.review_row(above, y) {
+            Some(row) => row
+                .iter()
                 .filter(|cell| !cell.is_wide_continuation)
                 .map(|cell| cell.data)
-                .collect()
-        } else {
-            String::new()
+                .collect(),
+            None => String::new(),
         }
     }
 
     /// Get line trimmed (removing trailing spaces) for cleaner speech output
     pub fn get_line_trimmed(&self, y: u16) -> String {
-        self.get_line(y).trim_end().to_string()
+        self.get_line_trimmed_at(0, y)
+    }
+
+    /// `get_line_at` with trailing spaces removed
+    pub fn get_line_trimmed_at(&self, above: usize, y: u16) -> String {
+        self.get_line_at(above, y).trim_end().to_string()
     }
 
     /// Resize the screen buffer
@@ -328,6 +380,16 @@ impl Screen {
         }
 
         for _ in 0..lines {
+            // The discarded top line goes to the history when it really is
+            // the top of the main screen (alternate-screen apps and regions
+            // that start lower down are redrawing, not scrolling output).
+            if top == 0 && !self.in_alt_screen {
+                if self.history.len() >= MAX_HISTORY {
+                    self.history.pop_front();
+                }
+                self.history.push_back(self.buffer[0].clone());
+            }
+
             // Shift each line in the scroll region up by one
             // This discards the top line and leaves space at bottom
             for y in top..bottom {
@@ -632,6 +694,48 @@ mod tests {
         // First line should now be what was second line
         assert_eq!(screen.get_char(0, 0), Some('B'));
         assert_eq!(screen.get_char(0, 1), Some('C'));
+    }
+
+    #[test]
+    fn test_scroll_up_keeps_history_of_main_screen_only() {
+        let mut screen = Screen::new(10, 3);
+        screen.buffer[0][0].data = 'A';
+        screen.buffer[1][0].data = 'B';
+        screen.buffer[2][0].data = 'C';
+        screen.scroll_up(2);
+        assert_eq!(screen.history_len(), 2);
+        // above = 1 is the line just off the top, 2 the one before it
+        assert_eq!(screen.get_line_trimmed_at(1, 0), "B");
+        assert_eq!(screen.get_line_trimmed_at(2, 0), "A");
+        assert_eq!(screen.get_char_at(2, 0, 0), Some('A'));
+        assert_eq!(screen.get_line_trimmed_at(3, 0), "");
+        // above = 0 is the screen itself
+        assert_eq!(screen.get_line_trimmed_at(0, 0), "C");
+
+        // A scroll region that leaves the top row alone is not output
+        // scrolling (DECSTBM parameters are 1-indexed: rows 2-3 here)
+        screen.set_scroll_region(2, 3);
+        screen.scroll_up(1);
+        assert_eq!(screen.history_len(), 2);
+        screen.set_scroll_region(1, 3);
+
+        // Nor is anything that happens on the alternate screen; the history
+        // is hidden while it is active and back afterwards
+        screen.save_screen();
+        screen.scroll_up(1);
+        assert_eq!(screen.history_len(), 0);
+        screen.restore_screen();
+        assert_eq!(screen.history_len(), 2);
+        assert_eq!(screen.get_line_trimmed_at(2, 0), "A");
+
+        // Capped: the oldest lines go first
+        for _ in 0..MAX_HISTORY {
+            screen.scroll_up(1);
+        }
+        assert_eq!(screen.history_len(), MAX_HISTORY);
+        // "A" and "B" were dropped; "C" is now the oldest line
+        assert_eq!(screen.get_line_trimmed_at(MAX_HISTORY, 0), "C");
+        assert_eq!(screen.get_line_trimmed_at(MAX_HISTORY - 1, 0), "");
     }
 
     #[test]

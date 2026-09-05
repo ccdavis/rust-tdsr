@@ -43,7 +43,7 @@ src/
 │   ├── pty.rs           # PTY spawn/resize (portable-pty)
 │   ├── emulator.rs      # vte parser driver
 │   ├── performer.rs     # vte Perform impl → screen + speech buffer (largest file)
-│   ├── screen.rs        # Screen buffer
+│   ├── screen.rs        # Screen buffer + scrollback history
 │   ├── cell.rs          # Character cell
 │   └── util.rs          # termios raw mode, terminal size
 ├── speech/
@@ -90,7 +90,7 @@ src/
 - Supports MBROLA voices (indices 10+) for higher quality speech on Linux/WSL
 - `handle_pty_output` drains everything the PTY has ready (up to 64 KB per event, via `Pty::has_more`) and then schedules `State::flush_speech` 5 ms later (`schedule_speech_flush`, guarded by `delaying_output`), so output written in several pieces becomes one utterance. A keypress cancels the pending flush and drops the unspoken text. `speak_output` applies repeated-symbol condensing; `speak` trims and skips empty text.
 - The performer inserts separators when the cursor jumps (including row changes via CUP), keeps auto-wrapped words whole, and treats text drawn after a carriage return on the same row as a rewrite that replaces that row's queued speech (progress bars are spoken once per flush, not once per redraw).
-- Key echo is detected at draw time: `State::last_key` is handed to the performer as `echo_key`; the first character drawn that equals it is the shell's echo, kept out of the speech buffer and returned so `main` can speak it as a letter (if `key_echo` is on). This works when zsh wraps the echo in escape sequences.
+- Key echo is detected at draw time: `State::last_key` is handed to the performer as `echo_key`; the first character drawn that changes a screen cell and equals it is the shell's echo, kept out of the speech buffer and returned so `main` can speak it as a letter (if `key_echo` is on). Characters that repaint a cell unchanged while a key is pending are queued provisionally (`SpeechBuffer::note_redraw`) and dropped when the echo arrives: zsh backspaces over the word being typed and redraws all of it (`BS c d` for the second letter of `cd`), which would otherwise be read as "cd". This also works when zsh wraps the echo in escape sequences.
 - DEC special graphics (`ESC ( 0`, SI/SO) are translated to box-drawing characters (`Screen::map_charset`), so ncurses/tmux borders are not read as "lqqqk".
 - Speech backend failures are non-fatal: `State::synth_op` logs them. `CommandSynth` respawns a dead server once and then backs off for a second between attempts.
 
@@ -126,7 +126,8 @@ Review cursor navigation uses Alt+key:
 - Line: `Alt+u/i/o` (prev/current/next)
 - Word: `Alt+j/k/l` (prev/current/next), double-tap `Alt+k` to spell
 - Char: `Alt+m/,/.` (prev/current/next), double-tap `Alt+,` for phonetic
-- Screen: `Alt+U/O` (top/bottom), `Alt+M/>` (start/end of line)
+- Screen: `Alt+U/O` (top/bottom), `Alt+M/>` (start/end of line). `Alt+U` when already on the top row jumps to the oldest scrolled-off line.
+- Scrollback: `Alt+u` from the top row keeps going into lines that scrolled off (`Screen::history`, capped at `MAX_HISTORY` = 2000, recorded only when the main screen's top row scrolls out). `ReviewCursor::above` counts how far above the screen the cursor is; every read goes through `Screen::get_line_at`/`get_char_at`, so word/char review and line copy work there. `Alt+o`/`Alt+O` and cursor tracking bring it back to the screen; `adjust_review_cursor_for_scroll` follows content into the history.
 - Config: `Alt+c` (then a letter; `?` lists keys; Enter or Escape leaves; unknown keys are announced), Copy: `Alt+v`, Quiet: `Alt+q`, Cancel: `Alt+x`
 - Numeric entry inside the config menu (rate, volume, voice, delay) accepts digits only, echoes each digit, and Escape or Enter on an empty value cancels
 

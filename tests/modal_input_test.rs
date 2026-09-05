@@ -275,3 +275,87 @@ fn speak_trims_and_skips_whitespace() {
     h.state.speak("  hi  ").unwrap();
     assert_eq!(h.spoken_text(), vec!["hi".to_string()]);
 }
+
+#[test]
+fn review_cursor_reads_lines_that_scrolled_off_the_top() {
+    let mut h = Harness::new();
+    // Eight lines on a five-row screen: l1..l4 scroll off, l5..l8 stay,
+    // the cursor ends on the blank bottom row, where tracking puts the
+    // review cursor.
+    h.emulator
+        .process(b"l1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6\r\nl7\r\nl8\r\n")
+        .unwrap();
+    h.emulator.screen_mut().take_scroll_offset();
+    h.state
+        .update_review_cursor_from_terminal(h.emulator.cursor());
+    assert_eq!(h.state.review.pos, (0, 4));
+    h.clear_spoken();
+
+    // Alt+u walks up the screen, then keeps going into the history
+    for _ in 0..8 {
+        h.feed(b"\x1bu");
+    }
+    assert_eq!(
+        h.spoken_text(),
+        vec!["l8", "l7", "l6", "l5", "l4", "l3", "l2", "l1"]
+    );
+    assert_eq!(h.state.review.above, 4);
+    h.clear_spoken();
+
+    // Oldest line: "top", and it stays put
+    h.feed(b"\x1bu");
+    assert_eq!(h.spoken_text(), vec!["top", "l1"]);
+    h.clear_spoken();
+
+    // Word and character review work on a history line
+    h.feed(b"\x1bk");
+    h.feed(b"\x1b.");
+    assert_eq!(h.spoken_text(), vec!["l1", "1"]);
+    h.clear_spoken();
+
+    // Alt+o comes back down; Alt+O jumps to the bottom of the screen
+    h.feed(b"\x1bo");
+    h.feed(b"\x1bO");
+    assert_eq!(h.spoken_text(), vec!["l2", "blank"]);
+    assert_eq!(h.state.review.above, 0);
+    h.clear_spoken();
+
+    // Alt+U: top of the screen first, the oldest history line on a repeat
+    h.feed(b"\x1bU");
+    h.feed(b"\x1bU");
+    h.feed(b"\x1bU");
+    assert_eq!(h.spoken_text(), vec!["l5", "l1", "l1"]);
+    h.clear_spoken();
+
+    // New output while reading the history: the cursor follows its line
+    h.feed(b"\x1bo");
+    h.feed(b"\x1bo");
+    assert_eq!(h.spoken_text(), vec!["l2", "l3"]);
+    h.clear_spoken();
+    h.emulator.process(b"l9\r\nl10\r\n").unwrap();
+    let scrolled = h.emulator.screen_mut().take_scroll_offset();
+    let (rows, history) = (
+        h.emulator.screen().size.1,
+        h.emulator.screen().history_len(),
+    );
+    h.state
+        .adjust_review_cursor_for_scroll(scrolled, rows, history);
+    h.feed(b"\x1bi");
+    assert_eq!(h.spoken_text(), vec!["l3"]);
+    h.clear_spoken();
+
+    // ...and so does a cursor on a screen row that scrolls off
+    h.state.review.above = 0;
+    h.state.review.pos = (0, 0);
+    h.emulator.process(b"l11\r\n").unwrap();
+    let scrolled = h.emulator.screen_mut().take_scroll_offset();
+    let (rows, history) = (
+        h.emulator.screen().size.1,
+        h.emulator.screen().history_len(),
+    );
+    h.state
+        .adjust_review_cursor_for_scroll(scrolled, rows, history);
+    h.feed(b"\x1bi");
+    assert_eq!(h.state.review.above, 1);
+    assert_eq!(h.spoken_text(), vec!["l7"]);
+}

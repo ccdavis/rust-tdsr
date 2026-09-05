@@ -25,10 +25,11 @@ pub struct ScreenPerformer<'a> {
     /// When true, insert line breaks in speech buffer at newlines
     pub line_pause: bool,
     /// The character the user just typed, if any. The first character the
-    /// terminal draws afterwards is compared against it: a match is the
-    /// shell echoing the keystroke, which is reported in `echoed` and kept
-    /// out of the speech buffer (key echo speaks it separately). Cleared by
-    /// the first draw either way, as in the original TDSR.
+    /// terminal draws afterwards that changes a screen cell is compared
+    /// against it: a match is the shell echoing the keystroke, which is
+    /// reported in `echoed` and kept out of the speech buffer (key echo
+    /// speaks it separately). Cleared by that draw either way. Characters
+    /// that repaint a cell unchanged are skipped over (see `print`).
     pub echo_key: &'a mut Option<char>,
     /// Set when a drawn character matched `echo_key`.
     pub echoed: Option<char>,
@@ -160,12 +161,6 @@ impl<'a> Perform for ScreenPerformer<'a> {
         // DEC special graphics (box drawing) when that charset is active
         let c = self.screen.map_charset(c);
 
-        // Is this the shell echoing the key the user just typed?
-        let is_echo = self.echo_key.take() == Some(c);
-        if is_echo {
-            self.echoed = Some(c);
-        }
-
         let mut wrapped = false;
         if self.screen.pending_wrap || self.screen.cursor.0 + width > cols {
             self.screen.pending_wrap = false;
@@ -177,6 +172,29 @@ impl<'a> Perform for ScreenPerformer<'a> {
         let (x, y) = self.screen.cursor;
         if y >= rows || x >= cols {
             return;
+        }
+
+        // Is this the shell echoing the key the user just typed? The echo is
+        // often not the first thing drawn: zsh backspaces over the word being
+        // typed and redraws all of it (`BS c d` for the second letter of
+        // `cd`). So while a key is pending, characters that repaint a cell
+        // with what it already holds are queued only provisionally
+        // (`note_redraw`), and the first character that changes a cell is the
+        // one compared against the key: a match drops the repaint, a mismatch
+        // keeps it as ordinary output. Blank cells already hold a space, so a
+        // space only counts as repaint inside a run that has already started;
+        // otherwise a typed space would never be recognised as its own echo.
+        let redraw = self.echo_key.is_some()
+            && (c != ' ' || self.speech_buffer.in_redraw())
+            && self
+                .screen
+                .buffer
+                .get(y as usize)
+                .and_then(|row| row.get(x as usize))
+                .is_some_and(|cell| cell.data == c && !cell.is_wide_continuation);
+        let is_echo = !redraw && self.echo_key.take() == Some(c);
+        if is_echo {
+            self.echoed = Some(c);
         }
 
         // Speech: text continuing right after the last printed character
@@ -221,7 +239,14 @@ impl<'a> Perform for ScreenPerformer<'a> {
         }
 
         // Add character to speech buffer for automatic reading
-        if !is_echo {
+        if is_echo {
+            self.speech_buffer.discard_redraw();
+        } else {
+            if redraw {
+                self.speech_buffer.note_redraw();
+            } else {
+                self.speech_buffer.end_redraw();
+            }
             self.speech_buffer.push(c);
         }
 
@@ -1056,6 +1081,109 @@ mod tests {
             performer.echoed
         };
         (speech_buffer, echoed)
+    }
+
+    /// Feed bytes into an existing screen/buffer with a typed key pending.
+    fn feed_echo(
+        screen: &mut Screen,
+        speech_buffer: &mut SpeechBuffer,
+        last_drawn: &mut (u16, u16),
+        key: Option<char>,
+        bytes: &[u8],
+    ) -> Option<char> {
+        let mut echo_key = key;
+        let mut parser = vte::Parser::new();
+        let mut performer = ScreenPerformer {
+            screen,
+            speech_buffer,
+            last_drawn,
+            line_pause: false,
+            echo_key: &mut echo_key,
+            echoed: None,
+        };
+        for &b in bytes {
+            parser.advance(&mut performer, b);
+        }
+        performer.echoed
+    }
+
+    #[test]
+    fn test_zsh_word_repaint_around_echo_is_not_spoken() {
+        // zsh redraws the word being typed: the second letter of `cd`
+        // arrives as `BS c d`. Only the new letter is the echo; the repaint
+        // of `c` must not be read as output ("c", then "cd").
+        let mut screen = Screen::new(20, 5);
+        let mut sb = SpeechBuffer::new();
+        let mut last_drawn = (0, 0);
+        feed_echo(&mut screen, &mut sb, &mut last_drawn, None, b"$ ");
+        sb.flush();
+        assert_eq!(
+            feed_echo(&mut screen, &mut sb, &mut last_drawn, Some('c'), b"c"),
+            Some('c')
+        );
+        assert_eq!(sb.contents().trim(), "");
+        assert_eq!(
+            feed_echo(&mut screen, &mut sb, &mut last_drawn, Some('d'), b"\x08cd"),
+            Some('d')
+        );
+        assert_eq!(sb.contents().trim(), "");
+        assert_eq!(screen.get_line_trimmed(0), "$ cd");
+
+        // The repaint may arrive in a separate read from the new letter
+        assert_eq!(
+            feed_echo(&mut screen, &mut sb, &mut last_drawn, Some(' '), b" "),
+            Some(' ')
+        );
+        assert_eq!(
+            feed_echo(&mut screen, &mut sb, &mut last_drawn, Some('l'), b"\x08 "),
+            None
+        );
+        assert_eq!(
+            feed_echo(&mut screen, &mut sb, &mut last_drawn, Some('l'), b"l"),
+            Some('l')
+        );
+        assert_eq!(sb.contents().trim(), "");
+        assert_eq!(screen.get_line_trimmed(0), "$ cd l");
+
+        // Doubled letters: the repaint of the first `l` is skipped, the
+        // second is the echo
+        assert_eq!(
+            feed_echo(&mut screen, &mut sb, &mut last_drawn, Some('l'), b"\x08ll"),
+            Some('l')
+        );
+        assert_eq!(sb.contents().trim(), "");
+        assert_eq!(screen.get_line_trimmed(0), "$ cd ll");
+
+        // A repaint spanning several words (syntax highlighting) is dropped too
+        assert_eq!(
+            feed_echo(
+                &mut screen,
+                &mut sb,
+                &mut last_drawn,
+                Some('s'),
+                b"\x1b[3Gcd lls"
+            ),
+            Some('s')
+        );
+        assert_eq!(sb.contents().trim(), "");
+
+        // A repaint followed by something other than the echo is real output
+        let mut screen = Screen::new(20, 5);
+        let mut sb = SpeechBuffer::new();
+        let mut last_drawn = (0, 0);
+        feed_echo(&mut screen, &mut sb, &mut last_drawn, None, b"ab");
+        sb.flush();
+        assert_eq!(
+            feed_echo(
+                &mut screen,
+                &mut sb,
+                &mut last_drawn,
+                Some('d'),
+                b"\x08\x08abx"
+            ),
+            None
+        );
+        assert_eq!(sb.contents().trim(), "abx");
     }
 
     #[test]

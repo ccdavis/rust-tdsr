@@ -12,7 +12,11 @@ pub mod command;
 // Windows SAPI backend for WSL
 pub mod windows;
 
-// PulseAudio backend using espeak-ng for WSL/WSLG
+// espeak-ng in-process with TDSR-managed PulseAudio playback (Linux/WSL)
+#[cfg(target_os = "linux")]
+pub mod espeak;
+
+// PulseAudio backend using espeak-ng subprocesses for WSL/WSLG (fallback)
 pub mod pulseaudio;
 
 // macOS AVFoundation backend, run as a `tdsr --speech-server` subprocess

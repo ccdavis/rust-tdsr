@@ -50,12 +50,14 @@ src/
 │   ├── mod.rs           # Speech module exports
 │   ├── synth.rs         # Synth trait and backend selection
 │   ├── buffer.rs        # Speech buffer accumulation
+│   ├── resample.rs      # 2x upsampler (22050 → 44100 Hz) for the in-process backend
 │   └── backends/
 │       ├── mod.rs       # Backend exports
 │       ├── command.rs   # Line-protocol speech server subprocess (macOS server, speech_command)
 │       ├── native.rs    # tts crate (Speech Dispatcher); not compiled on macOS
 │       ├── windows.rs   # Windows SAPI via PowerShell (WSL)
-│       ├── pulseaudio.rs # espeak-ng with PulseAudio (WSLG fallback)
+│       ├── espeak.rs    # Linux/WSL: libespeak-ng in-process + own PulseAudio playback (audio thread)
+│       ├── pulseaudio.rs # espeak-ng subprocesses with PulseAudio (fallback)
 │       └── avfoundation.rs # macOS: subprocess speech server (primary)
 ├── input/
 │   ├── mod.rs           # Input module exports
@@ -86,7 +88,8 @@ src/
 **Speech System** (`speech/`):
 - `Synth` trait defines speak/cancel/set_rate/set_volume/set_voice
 - Backend selection in `synth.rs`: WSL → PulseAudio/SAPI/native; Linux → native/PulseAudio; macOS → avfoundation (subprocess), native fallback
-- PulseAudio backend uses a persistent espeak-ng process (stdin line-by-line mode) for proper speech queuing
+- **Linux/WSL primary espeak backend is in-process** (`backends/espeak.rs`): `libespeak-ng.so.1` and `libpulse-simple.so.0` are `dlopen`ed (`libloading`, no build deps) on a dedicated audio thread. espeak-ng hands the thread 20 ms PCM chunks; it upsamples them to 44100 Hz (`speech/resample.rs`) and writes them into a 40 ms PulseAudio playback buffer (prebuf 0). `Synth` methods only push onto a queue; `cancel` sets a flag that aborts synthesis at the next chunk and flushes the server buffer. The WSLg RDP sink (module-rdp-sink) forwards audio to Windows in 5 ms blocks with up to 1.3 s outstanding; the Windows side plays ~5-8% slower than the sink sends, so the backlog grows with everything sent (silence included) and drains only while the sink has no stream at all; once saturated the WSLg pulse server wedges (connections refused). So the backend transmits sound only: espeak's pauses (≥60 ms) become closed-stream gaps of the same length, the stream's reported latency is checked every 250 ms of sound and a drain gap inserted above 200 ms, and the stream is closed whenever idle. A keep-alive thread on WSL holds a recording of `@DEFAULT_MONITOR@` so the sink never suspends (it never resets its pacing clock on resume and would burst). Measured floor on WSLg is ~50 ms from write to audible (RDP path); on native Linux it is the sink's latency.
+- `backends/pulseaudio.rs` is the fallback when the libraries cannot be loaded: one short-lived espeak-ng subprocess per batch from a worker thread, `cancel` kills it, `-z` for letter-only batches, and a `parec` wake of a suspended WSLg sink before speaking after >4 s of silence.
 - Supports MBROLA voices (indices 10+) for higher quality speech on Linux/WSL
 - `handle_pty_output` drains everything the PTY has ready (up to 64 KB per event, via `Pty::has_more`) and then schedules `State::flush_speech` 5 ms later (`schedule_speech_flush`, guarded by `delaying_output`), so output written in several pieces becomes one utterance. A keypress cancels the pending flush and drops the unspoken text. `speak_output` applies repeated-symbol condensing; `speak` trims and skips empty text.
 - The performer inserts separators when the cursor jumps (including row changes via CUP), keeps auto-wrapped words whole, and treats text drawn after a carriage return on the same row as a rewrite that replaces that row's queued speech (progress bars are spoken once per flush, not once per redraw).
@@ -107,13 +110,15 @@ Voice selection (priority in `Worker::speak`): explicit `voice_idx` → `AVSpeec
 ### Speech Backend Priority
 
 **WSL:**
-1. PulseAudio + espeak-ng (if WSLG available)
-2. Windows SAPI via PowerShell
-3. Speech Dispatcher (fallback)
+1. espeak-ng in-process + own PulseAudio playback (`backends/espeak.rs`, if WSLG available)
+2. PulseAudio + espeak-ng subprocesses (if the libraries cannot be loaded)
+3. Windows SAPI via PowerShell
+4. Speech Dispatcher (fallback)
 
 **Linux:**
 1. Speech Dispatcher (via tts crate)
-2. PulseAudio + espeak-ng
+2. espeak-ng in-process + own PulseAudio playback
+3. PulseAudio + espeak-ng subprocesses
 
 **macOS:**
 1. AVFoundation via `tdsr --speech-server` subprocess (see `backends/avfoundation.rs`) — the only backend. The `tts` crate is not a dependency on macOS (its in-process AVFoundation path plays one utterance and goes silent). If the subprocess cannot start, `create_synth` speaks the error through `/usr/bin/say` (`say_blocking`) and returns it, so TDSR exits with an audible reason.

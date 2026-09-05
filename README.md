@@ -50,6 +50,8 @@ Also, it's nice to have a single binary to deploy wherever you need a talking te
 - Rust 1.70 or later (for building)
 - Build dependencies: same as Linux
 - Runtime: Uses PulseAudio + espeak-ng (via WSLG), falls back to Windows SAPI or Speech Dispatcher
+- Speech runs espeak-ng in-process (`libespeak-ng`, installed with `espeak-ng`) and plays through WSLg's PulseAudio itself; see [WSL.md](WSL.md) for why that matters on WSL
+- Optional: `sudo apt install pulseaudio-utils` (`parec`, used only by the subprocess fallback backend to wake WSLg's audio sink after a pause)
 - Optional (better voices): `sudo apt install mbrola mbrola-us1 mbrola-us2`
 - See [WSL.md](WSL.md) for details
 
@@ -126,8 +128,8 @@ Configuration file: `~/.tdsr.cfg` (INI format)
 ### Speech Settings
 
 TDSR uses native speech synthesis:
-- **Linux:** Speech Dispatcher, or PulseAudio + espeak-ng as fallback
-- **WSL:** PulseAudio + espeak-ng (via WSLG), Windows SAPI fallback, Speech Dispatcher fallback
+- **Linux:** Speech Dispatcher, or espeak-ng (in-process, own PulseAudio playback) as fallback
+- **WSL:** espeak-ng in-process with its own PulseAudio playback (via WSLG), then espeak-ng subprocesses, Windows SAPI, Speech Dispatcher
 - **macOS:** AVFoundation (built into macOS 10.14+)
 
 Any platform can instead use an external speech server: set `speech_command`

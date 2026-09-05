@@ -1428,6 +1428,7 @@ dependencies = [
  "core-foundation-sys",
  "dirs",
  "env_logger",
+ "libloading",
  "log",
  "mio",
  "nix 0.29.0",

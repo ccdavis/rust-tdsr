@@ -1,10 +1,9 @@
 //! Platform-specific speech backends
 
-// Native TTS backend using the tts crate (Speech Dispatcher on Linux and other
-// Unixes). Optional: only compiled when the `native-speech` feature is enabled,
-// and never on macOS, where it cannot work (see avfoundation.rs).
+// Speech Dispatcher client (Linux and other Unixes). Optional: only compiled
+// when the `native-speech` feature is enabled, and never on macOS.
 #[cfg(all(feature = "native-speech", not(target_os = "macos")))]
-pub mod native;
+pub mod speechd;
 
 // External speech server driven over stdin (macOS server, custom commands)
 pub mod command;

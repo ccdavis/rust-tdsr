@@ -10,6 +10,9 @@ use tdsr::state::State;
 use tdsr::terminal::Emulator;
 use tdsr::Result;
 
+/// The voices the recording synth pretends to have: (persistent id, name).
+const MOCK_VOICES: &[(&str, &str)] = &[("gmw/af", "Afrikaans"), ("gmw/en-US", "English (America)")];
+
 /// Synth that records every command instead of speaking.
 struct RecordingSynth(Arc<Mutex<Vec<SpeechCommand>>>);
 
@@ -24,8 +27,31 @@ impl Synth for RecordingSynth {
     fn set_volume(&mut self, volume: u8) -> Result<()> {
         self.send(SpeechCommand::SetVolume(volume))
     }
+    /// Pretends to know two voices, like the espeak backends do; a voice
+    /// change is recorded as `SetVoiceIdx` of the matching index.
     fn set_voice_idx(&mut self, idx: usize) -> Result<()> {
-        self.send(SpeechCommand::SetVoiceIdx(idx))
+        let id = self
+            .voice_id(idx)
+            .ok_or_else(|| tdsr::TdsrError::Speech(format!("no voice {}", idx)))?;
+        self.set_voice(&id).map(|_| ())
+    }
+    fn set_voice(&mut self, id: &str) -> Result<String> {
+        let idx = MOCK_VOICES
+            .iter()
+            .position(|(voice_id, _)| *voice_id == id)
+            .ok_or_else(|| tdsr::TdsrError::Speech(format!("no voice named {}", id)))?;
+        self.send(SpeechCommand::SetVoiceIdx(idx))?;
+        Ok(MOCK_VOICES[idx].1.to_string())
+    }
+    fn voice_count(&self) -> Option<usize> {
+        Some(MOCK_VOICES.len())
+    }
+    fn voice_id(&self, idx: usize) -> Option<String> {
+        MOCK_VOICES.get(idx).map(|(id, _)| id.to_string())
+    }
+    /// Old numbering: index 1 used to mean US English.
+    fn legacy_voice_id(&self, idx: usize) -> Option<String> {
+        (idx == 1).then(|| "gmw/en-US".to_string())
     }
     fn speak(&mut self, text: &str) -> Result<()> {
         self.send(SpeechCommand::Speak(text.to_string()))
@@ -48,8 +74,17 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
+        Self::with_config("")
+    }
+
+    /// A harness whose config file starts with `contents`.
+    fn with_config(contents: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load_from(dir.path().join("tdsr.cfg")).unwrap();
+        let path = dir.path().join("tdsr.cfg");
+        if !contents.is_empty() {
+            std::fs::write(&path, contents).unwrap();
+        }
+        let config = Config::load_from(path).unwrap();
         let spoken = Arc::new(Mutex::new(Vec::new()));
         let synth = Box::new(RecordingSynth(spoken.clone()));
         let state = State::from_parts(config, synth, 20, 5).unwrap();
@@ -130,6 +165,85 @@ fn config_menu_numeric_entry_sets_rate() {
     assert!(h.feed(b"\r").is_empty());
     assert_eq!(h.state.handlers.len(), 0);
     assert_eq!(h.feed(b"a"), vec![b"a".to_vec()]);
+}
+
+#[test]
+fn config_menu_voice_entry_saves_the_id_and_rejects_bad_indices() {
+    let mut h = Harness::new();
+
+    // A voice the backend knows: its persistent id is saved and the name
+    // announced.
+    assert!(h.feed(b"\x1bcV1\r").is_empty());
+    assert!(h
+        .commands()
+        .iter()
+        .any(|c| matches!(c, SpeechCommand::SetVoiceIdx(1))));
+    assert_eq!(h.state.config.voice().as_deref(), Some("gmw/en-US"));
+    assert_eq!(h.state.config.voice_idx(), None);
+    assert_eq!(
+        h.spoken_text().last().map(String::as_str),
+        Some("confirmed, English (America)")
+    );
+
+    // An index past the list: refused, nothing saved or sent.
+    h.clear_spoken();
+    assert!(h.feed(b"V7\r").is_empty());
+    assert!(!h
+        .commands()
+        .iter()
+        .any(|c| matches!(c, SpeechCommand::SetVoiceIdx(7))));
+    assert_eq!(h.state.config.voice().as_deref(), Some("gmw/en-US"));
+    assert_eq!(
+        h.spoken_text().last().map(String::as_str),
+        Some("no voice 7, the last voice is 1")
+    );
+    assert_eq!(h.state.handlers.len(), 1, "back in the config menu");
+    assert!(h.feed(b"\r").is_empty());
+}
+
+#[test]
+fn configured_voice_is_applied_and_a_legacy_index_is_migrated() {
+    // `voice` wins and is applied by id.
+    let h = Harness::with_config("[speech]\nvoice = gmw/af\n");
+    assert!(h
+        .commands()
+        .iter()
+        .any(|c| matches!(c, SpeechCommand::SetVoiceIdx(0))));
+    assert!(h.spoken_text().is_empty(), "{:?}", h.spoken_text());
+
+    // A bare voice_idx from an older config is read with the old meaning,
+    // rewritten as `voice`, and the change announced.
+    let h = Harness::with_config("[speech]\nvoice_idx = 1\n");
+    assert!(h
+        .commands()
+        .iter()
+        .any(|c| matches!(c, SpeechCommand::SetVoiceIdx(1))));
+    assert_eq!(h.state.config.voice().as_deref(), Some("gmw/en-US"));
+    assert_eq!(h.state.config.voice_idx(), None);
+    assert_eq!(
+        h.spoken_text().first().map(String::as_str),
+        Some("voice setting updated to English (America)")
+    );
+    let saved = std::fs::read_to_string(h._dir.path().join("tdsr.cfg")).unwrap();
+    assert!(
+        saved.contains("voice=gmw/en-US") || saved.contains("voice = gmw/en-US"),
+        "{}",
+        saved
+    );
+    assert!(!saved.contains("voice_idx"), "{}", saved);
+
+    // A voice that does not exist is announced and the default kept.
+    let h = Harness::with_config("[speech]\nvoice = klingon\n");
+    assert!(!h
+        .commands()
+        .iter()
+        .any(|c| matches!(c, SpeechCommand::SetVoiceIdx(_))));
+    let first = h.spoken_text().first().cloned().unwrap_or_default();
+    assert!(
+        first.starts_with("Configured voice klingon not used"),
+        "{}",
+        first
+    );
 }
 
 #[test]

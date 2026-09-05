@@ -40,8 +40,44 @@ pub trait Synth: Send {
     /// Set speech volume (0-100)
     fn set_volume(&mut self, volume: u8) -> Result<()>;
 
-    /// Set voice by index (platform-specific)
+    /// Set voice by index into the backend's current voice list (what the
+    /// config menu and `--list-voices` number). Backends that know their
+    /// voices return an error, phrased to be spoken, for an index that
+    /// cannot be used.
     fn set_voice_idx(&mut self, idx: usize) -> Result<()>;
+
+    /// Set voice by the persistent id `voice_id` reported for it (what the
+    /// config stores as `voice`). Returns the voice's spoken name. Backends
+    /// that only have indices leave the default, an error.
+    fn set_voice(&mut self, id: &str) -> Result<String> {
+        Err(crate::TdsrError::Speech(format!(
+            "this speech backend selects voices by index, not by name ({})",
+            id
+        )))
+    }
+
+    /// How many voices the backend lists, or `None` for a backend that has
+    /// no list and can only pass an index on (the macOS server, external
+    /// speech commands, SAPI).
+    fn voice_count(&self) -> Option<usize> {
+        None
+    }
+
+    /// Persistent id of the voice at `idx` (an espeak-ng voice file, a
+    /// Speech Dispatcher voice name); `None` if the backend has no list or
+    /// the index is out of range.
+    fn voice_id(&self, idx: usize) -> Option<String> {
+        let _ = idx;
+        None
+    }
+
+    /// The voice an older TDSR meant by a saved `voice_idx = idx`, for
+    /// backends whose numbering changed since. Only consulted for a config
+    /// that has `voice_idx` but no `voice`; the result is migrated to
+    /// `voice`. Defaults to the current meaning of the index.
+    fn legacy_voice_id(&self, idx: usize) -> Option<String> {
+        self.voice_id(idx)
+    }
 
     /// Speak text to the user
     fn speak(&mut self, text: &str) -> Result<()>;
@@ -156,9 +192,9 @@ pub fn create_synth(speech_command: Option<&str>) -> Result<Box<dyn Synth>> {
         #[cfg(all(feature = "native-speech", not(target_os = "macos")))]
         {
             info!("Trying Speech Dispatcher backend...");
-            use super::backends::native::NativeSynth;
+            use super::backends::speechd::SpeechDispatcherSynth;
 
-            match NativeSynth::new() {
+            match SpeechDispatcherSynth::new() {
                 Ok(synth) => {
                     info!("✓ Successfully initialized Speech Dispatcher backend");
                     return Ok(Box::new(synth));
@@ -187,9 +223,9 @@ pub fn create_synth(speech_command: Option<&str>) -> Result<Box<dyn Synth>> {
         #[cfg(all(feature = "native-speech", not(target_os = "macos")))]
         {
             info!("Trying Speech Dispatcher backend...");
-            use super::backends::native::NativeSynth;
+            use super::backends::speechd::SpeechDispatcherSynth;
 
-            match NativeSynth::new() {
+            match SpeechDispatcherSynth::new() {
                 Ok(synth) => {
                     info!("✓ Successfully initialized Speech Dispatcher backend");
                     return Ok(Box::new(synth));
@@ -260,9 +296,9 @@ pub fn create_synth(speech_command: Option<&str>) -> Result<Box<dyn Synth>> {
             "Creating native speech synthesizer for platform: {}",
             platform
         );
-        use super::backends::native::NativeSynth;
+        use super::backends::speechd::SpeechDispatcherSynth;
 
-        match NativeSynth::new() {
+        match SpeechDispatcherSynth::new() {
             Ok(synth) => {
                 info!("✓ Successfully initialized native TTS backend");
                 Ok(Box::new(synth))
@@ -278,7 +314,7 @@ pub fn create_synth(speech_command: Option<&str>) -> Result<Box<dyn Synth>> {
     {
         Err(crate::TdsrError::Speech(format!(
             "No speech backend available for platform '{}'. This binary was built \
-             without the 'native-speech' feature, so the Speech Dispatcher / tts \
+             without the 'native-speech' feature, so the Speech Dispatcher \
              backend is not included.",
             platform
         )))

@@ -52,7 +52,7 @@ CARGO_FLAGS=()
 
 # Check Linux build dependencies and choose a build mode.
 #
-# Full build (default): uses the `tts` crate → Speech Dispatcher. Needs
+# Full build (default): includes the Speech Dispatcher backend. Needs
 #   libclang-dev and libspeechd-dev >= 0.10 at build time.
 # espeak-ng-only build (--no-default-features): no Speech Dispatcher, no
 #   libclang/libspeechd needed. Auto-selected when speech-dispatcher is missing
@@ -60,7 +60,7 @@ CARGO_FLAGS=()
 if [[ "$OSTYPE" == "linux-gnu"* ]]; then
     echo -e "${YELLOW}Checking build dependencies...${NC}"
 
-    # Is the system speech-dispatcher new enough for the `tts` crate (>= 0.10)?
+    # Is the system speech-dispatcher new enough for the `speech-dispatcher` crate (>= 0.10)?
     SPEECHD_OK=0
     SPD_VER="$(pkg-config --modversion speech-dispatcher 2>/dev/null || true)"
     if [[ -n "$SPD_VER" ]]; then

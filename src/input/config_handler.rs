@@ -33,6 +33,15 @@ const CONFIG_HELP: &str = "config keys: r rate, v volume, capital V voice, d del
 p symbols, e character echo, c cursor tracking, l line pause, s repeated symbols, \
 enter or escape to exit";
 
+/// An error's message without the "Speech synthesis error:" prefix, for
+/// speaking.
+fn spoken_error(e: &crate::TdsrError) -> String {
+    match e {
+        crate::TdsrError::Speech(msg) => msg.clone(),
+        other => other.to_string(),
+    }
+}
+
 impl Default for ConfigHandler {
     fn default() -> Self {
         Self::new()
@@ -253,19 +262,50 @@ impl ConfigHandler {
         Ok(())
     }
 
-    /// Set voice index from user input
+    /// Set voice from a menu index. A backend that knows its voices maps
+    /// the index to a persistent id, which is saved as `voice` only if the
+    /// backend accepts it (a rejection is spoken in the backend's words).
+    /// A backend that only has indices cannot judge them, so the index is
+    /// saved as `voice_idx` whether or not the send succeeded (it may have
+    /// failed only because the speech server is down right now).
     fn set_voice_idx(input: String, state: &mut State) -> Result<()> {
-        match input.parse::<usize>() {
-            Ok(idx) => {
-                debug!("Setting voice index to {}", idx);
-                state.config.set("speech", "voice_idx", &idx.to_string());
-                state.save_config()?;
-                state.synth.set_voice_idx(idx)?;
-                state.speak("confirmed")?;
-            }
+        let idx = match input.parse::<usize>() {
+            Ok(idx) => idx,
             Err(_) => {
                 debug!("Invalid voice index value: {}", input);
-                state.speak("invalid")?;
+                return state.speak("invalid");
+            }
+        };
+        debug!("Setting voice index to {}", idx);
+        match (state.synth.voice_count(), state.synth.voice_id(idx)) {
+            (Some(_), Some(id)) => match state.synth.set_voice(&id) {
+                Ok(name) => {
+                    state.config.set("speech", "voice", &id);
+                    state.config.remove("speech", "voice_idx");
+                    state.save_config()?;
+                    state.speak(&format!("confirmed, {}", name))?;
+                }
+                Err(e) => {
+                    debug!("Voice {} (index {}) rejected: {}", id, idx, e);
+                    state.speak(&spoken_error(&e))?;
+                }
+            },
+            (Some(0), None) => state.speak("this speech backend lists no voices")?,
+            (Some(n), None) => {
+                state.speak(&format!("no voice {}, the last voice is {}", idx, n - 1))?
+            }
+            (None, _) => {
+                let result = state.synth.set_voice_idx(idx);
+                state.config.set("speech", "voice_idx", &idx.to_string());
+                state.config.remove("speech", "voice");
+                state.save_config()?;
+                match result {
+                    Ok(()) => state.speak("confirmed")?,
+                    Err(e) => {
+                        debug!("Voice index {} not applied: {}", idx, e);
+                        state.speak(&spoken_error(&e))?;
+                    }
+                }
             }
         }
         Ok(())

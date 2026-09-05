@@ -76,21 +76,22 @@ Your `~/.tdsr.cfg` works the same as on Linux/macOS:
 [speech]
 rate = 50           # 0=slowest, 50=normal, 100=fastest
 volume = 80         # 0=quietest, 100=loudest
-voice_idx = 0       # Voice index (see below)
+voice = gmw/en-US   # a voice from `tdsr --list-voices`
 ```
 
-### Voice Selection (espeak-ng / PulseAudio backend)
+### Voice Selection (espeak-ng backends)
 
-Set `voice_idx` in your config or use the config menu (Alt+c → V):
+Run `tdsr --list-voices` for every espeak-ng voice and installed MBROLA voice,
+then either press Alt+c, V, type the index and Enter inside TDSR (the voice's
+name is saved for you), or put the bracketed voice file in your config:
 
-| Index | Voice | Notes |
-|-------|-------|-------|
-| 0 | en | Default English (espeak-ng built-in) |
-| 1 | en-us | US English (espeak-ng built-in) |
-| 10 | mb-us1 | US English Female (requires `mbrola mbrola-us1`) |
-| 11 | mb-us2 | US English Male (requires `mbrola mbrola-us2`) |
+```ini
+[speech]
+voice = mb/mb-us1    # MBROLA US English Female
+```
 
-See the [README](README.md#voice-selection-linux--wsl-with-espeak-ng-backend) for the full voice table.
+An older `voice_idx` line keeps its old meaning and is migrated on first
+start. See the [README](README.md#voice-selection-linux--wsl) for details.
 
 ### Installing MBROLA Voices
 
@@ -98,12 +99,6 @@ MBROLA voices use diphone synthesis and sound more natural than the default espe
 
 ```bash
 sudo apt install mbrola mbrola-us1 mbrola-us2
-```
-
-Then set in `~/.tdsr.cfg`:
-```ini
-[speech]
-voice_idx = 10    # MBROLA US English Female
 ```
 
 ## How It Works

@@ -37,6 +37,7 @@
 //! - parec from pulseaudio-utils, for the WSL sink wake-up (optional)
 
 use crate::platform::is_wsl;
+use crate::speech::voices::{legacy_voice_name, VoiceCatalogue};
 use crate::speech::{SpeechCommand, Synth};
 use crate::{Result, TdsrError};
 use log::{debug, info, warn};
@@ -53,6 +54,9 @@ use std::time::{Duration, Instant};
 /// its last stream closes; waking a sink that is merely idle is harmless.
 const SINK_SUSPEND_GUARD: Duration = Duration::from_secs(4);
 
+/// How often the worker checks whether its espeak-ng process has exited.
+const REAP_POLL: Duration = Duration::from_millis(5);
+
 /// How long the monitor recording is held open during a wake-up. The sink
 /// resumes as soon as the recording stream is created; this leaves margin
 /// for parec to start and connect.
@@ -67,7 +71,7 @@ struct Settings {
     rate: u8,
     /// TDSR volume (0-100)
     volume: u8,
-    /// espeak-ng voice name
+    /// espeak-ng voice name or identifier (`gmw/en-US`, `mb/mb-us1`)
     voice: String,
 }
 
@@ -123,6 +127,7 @@ impl Shared {
 /// worker thread
 pub struct PulseAudioSynth {
     shared: Arc<Shared>,
+    voices: VoiceCatalogue,
 }
 
 /// Setup PulseAudio server environment
@@ -175,31 +180,6 @@ pub(crate) fn wpm_for_rate(tdsr_rate: u8) -> u16 {
     80 + ((tdsr_rate as u16) * 370 / 100)
 }
 
-/// espeak-ng voice name for a TDSR voice index
-///
-/// Indices 0-9: espeak-ng built-in voices (always available)
-/// Indices 10+: MBROLA voices (require mbrola + voice data packages)
-pub(crate) fn espeak_voice_name(idx: usize) -> &'static str {
-    const VOICES: &[&str] = &[
-        "en",     // 0: Default English
-        "en-us",  // 1: US English
-        "en-gb",  // 2: British English
-        "en-sc",  // 3: Scottish English
-        "es",     // 4: Spanish
-        "fr",     // 5: French
-        "de",     // 6: German
-        "it",     // 7: Italian
-        "pt",     // 8: Portuguese
-        "ru",     // 9: Russian
-        "mb-us1", // 10: MBROLA US English Female (apt: mbrola mbrola-us1)
-        "mb-us2", // 11: MBROLA US English Male (apt: mbrola mbrola-us2)
-        "mb-us3", // 12: MBROLA US English Male 2 (apt: mbrola mbrola-us3)
-        "mb-en1", // 13: MBROLA British English Male (apt: mbrola mbrola-en1)
-    ];
-
-    VOICES.get(idx).unwrap_or(&"en")
-}
-
 impl PulseAudioSynth {
     /// Create a new PulseAudio synthesizer
     ///
@@ -214,6 +194,8 @@ impl PulseAudioSynth {
         // Find espeak-ng
         let espeak_path = Self::find_espeak()?;
         debug!("Found espeak-ng at: {}", espeak_path);
+        let voices = VoiceCatalogue::from_command(&espeak_path)?;
+        debug!("espeak-ng offers {} voices", voices.len());
 
         // The sink wake-up only matters for WSLg's RDP sink, and needs parec.
         let wake_sink = is_wsl() && Self::have_program("parec");
@@ -244,7 +226,7 @@ impl PulseAudioSynth {
             .spawn(move || worker(worker_shared))
             .map_err(|e| TdsrError::Speech(format!("Failed to start speech worker: {}", e)))?;
 
-        Ok(Self { shared })
+        Ok(Self { shared, voices })
     }
 
     /// Find espeak-ng executable
@@ -284,11 +266,6 @@ impl PulseAudioSynth {
         // espeak-ng's default amplitude is 100; values above 100 cause
         // clipping and distortion (scratchy/static audio)
         tdsr_volume
-    }
-
-    /// Get voice name by index (see `espeak_voice_name`)
-    fn get_voice_by_idx(idx: usize) -> &'static str {
-        espeak_voice_name(idx)
     }
 
     /// Command-line arguments for one espeak-ng process.
@@ -432,17 +409,32 @@ fn worker(shared: Arc<Shared>) {
             }
         }
 
-        match child.wait() {
-            Ok(status) if !status.success() => {
-                debug!("espeak-ng exited with {}", status);
+        // Reap the process under the lock that publishes its PID, and clear
+        // the PID in the same critical section: once `try_wait` has reaped
+        // it the kernel may hand the number to a new process, and cancel()
+        // must never see a PID it could kill by mistake.
+        loop {
+            let mut inner = shared.lock();
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        debug!("espeak-ng exited with {}", status);
+                    }
+                    inner.current_pid = None;
+                    inner.last_stream_end = Some(Instant::now());
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Waiting for espeak-ng failed: {}", e);
+                    inner.current_pid = None;
+                    inner.last_stream_end = Some(Instant::now());
+                    break;
+                }
             }
-            Err(e) => warn!("Waiting for espeak-ng failed: {}", e),
-            _ => {}
+            drop(inner);
+            thread::sleep(REAP_POLL);
         }
-
-        let mut inner = shared.lock();
-        inner.current_pid = None;
-        inner.last_stream_end = Some(Instant::now());
     }
 }
 
@@ -471,10 +463,45 @@ impl Synth for PulseAudioSynth {
     }
 
     fn set_voice_idx(&mut self, idx: usize) -> Result<()> {
-        let voice = Self::get_voice_by_idx(idx);
-        debug!("Setting voice to {} (index {})", voice, idx);
-        self.update_settings(|s| s.voice = voice.to_string());
-        Ok(())
+        let id = self.voices.select(idx)?.identifier.clone();
+        self.set_voice(&id).map(|_| ())
+    }
+
+    /// Select by identifier or any name espeak-ng accepts. Each utterance
+    /// is a fresh process, so there is no verdict to wait for: a catalogue
+    /// voice missing its MBROLA data is refused here, anything else is
+    /// handed to espeak-ng as given.
+    fn set_voice(&mut self, id: &str) -> Result<String> {
+        let (ident, name) = match self.voices.find(id) {
+            Some(v) => {
+                self.voices.check_usable(v)?;
+                (v.identifier.clone(), v.describe())
+            }
+            None => (id.trim().to_string(), id.trim().to_string()),
+        };
+        debug!("Setting voice to {}", ident);
+        self.update_settings(|s| s.voice = ident);
+        Ok(name)
+    }
+
+    fn voice_count(&self) -> Option<usize> {
+        Some(self.voices.len())
+    }
+
+    fn voice_id(&self, idx: usize) -> Option<String> {
+        self.voices.get(idx).map(|v| v.identifier.clone())
+    }
+
+    /// Before the catalogue, `voice_idx` indexed a fixed table of espeak-ng
+    /// voice names.
+    fn legacy_voice_id(&self, idx: usize) -> Option<String> {
+        let name = legacy_voice_name(idx)?;
+        Some(
+            self.voices
+                .find(name)
+                .map(|v| v.identifier.clone())
+                .unwrap_or_else(|| name.to_string()),
+        )
     }
 
     fn speak(&mut self, text: &str) -> Result<()> {
@@ -541,14 +568,6 @@ mod tests {
         assert_eq!(PulseAudioSynth::volume_to_espeak_amplitude(0), 0);
         assert_eq!(PulseAudioSynth::volume_to_espeak_amplitude(50), 50);
         assert_eq!(PulseAudioSynth::volume_to_espeak_amplitude(100), 100);
-    }
-
-    #[test]
-    fn test_voice_selection() {
-        assert_eq!(PulseAudioSynth::get_voice_by_idx(0), "en");
-        assert_eq!(PulseAudioSynth::get_voice_by_idx(1), "en-us");
-        assert_eq!(PulseAudioSynth::get_voice_by_idx(2), "en-gb");
-        assert_eq!(PulseAudioSynth::get_voice_by_idx(999), "en"); // Out of range defaults to en
     }
 
     #[test]

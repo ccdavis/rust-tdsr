@@ -143,7 +143,7 @@ original Python TDSR's speech servers used, so those scripts work unchanged.
 speech_command = python3 /path/to/my_server.py   # optional external synth
 rate = 50           # Speech rate: 0 (slowest) to 100 (fastest), default 50
 volume = 80         # Volume: 0 (quietest) to 100 (loudest), default 80
-voice_idx = 0       # Voice index (see voice table below)
+voice = gmw/en-US   # Linux/WSL: a voice from `tdsr --list-voices` (macOS: voice_idx)
 cursor_delay = 300  # Milliseconds before speaking cursor position
 process_symbols = false  # Convert symbols to words
 key_echo = true     # Speak characters as you type
@@ -177,46 +177,53 @@ To return to the default (Eloquence if installed, else VoiceOver), remove `voice
 
 **Note:** `--list-voices` shows the voices Apple exposes to apps. VoiceOver's own Siri voices are *not* in that list — the only way to use them is the default (VoiceOver-follow) setting, i.e. no `voice_idx` and no Eloquence installed.
 
-### Voice Selection (Linux / WSL with espeak-ng backend)
+### Voice Selection (Linux / WSL)
 
-Set `voice_idx` in `~/.tdsr.cfg` or change via the config menu (Alt+c → V).
-
-**Built-in espeak-ng voices (always available):**
-
-| Index | Voice | Description |
-|-------|-------|-------------|
-| 0 | en | Default English |
-| 1 | en-us | US English |
-| 2 | en-gb | British English |
-| 3 | en-sc | Scottish English |
-| 4 | es | Spanish |
-| 5 | fr | French |
-| 6 | de | German |
-| 7 | it | Italian |
-| 8 | pt | Portuguese |
-| 9 | ru | Russian |
-
-**MBROLA voices (higher quality, require additional packages):**
-
-| Index | Voice | Description | Package |
-|-------|-------|-------------|---------|
-| 10 | mb-us1 | US English Female | `mbrola mbrola-us1` |
-| 11 | mb-us2 | US English Male | `mbrola mbrola-us2` |
-| 12 | mb-us3 | US English Male 2 | `mbrola mbrola-us3` |
-| 13 | mb-en1 | British English Male | `mbrola mbrola-en1` |
-
-MBROLA voices use diphone synthesis and generally sound more natural than the default espeak-ng formant voices. To install on Debian/Ubuntu:
+List the voices the speech backend offers:
 
 ```bash
-sudo apt install mbrola mbrola-us1 mbrola-us2
+tdsr --list-voices
 ```
 
-Then set your preferred voice in `~/.tdsr.cfg`:
+With the espeak-ng backends (WSL, and Linux without Speech Dispatcher) the
+list has espeak-ng's own voices first (every language it ships), then the
+installed MBROLA voices, each with an index and its voice file in brackets.
+With Speech Dispatcher (native Linux) it is the voices of the daemon's current
+output module; other synthesizers are chosen in Speech Dispatcher's own
+configuration (`spd-conf`).
+
+Pick a voice live from the config menu: press Alt+c, then capital V, type the
+index and press Enter. TDSR speaks "confirmed" and the voice's name in the new
+voice, and saves the voice's *name* (not the number) to `~/.tdsr.cfg`:
 
 ```ini
 [speech]
-voice_idx = 10    # MBROLA US English Female
+voice = gmw/en-US            # espeak-ng: the voice file from --list-voices
+# voice = English (America)  # Speech Dispatcher: the voice name
 ```
+
+You can also write that line by hand. An index that does not exist, or an
+MBROLA voice whose data is not installed, is refused with a spoken reason and
+nothing is saved. A `voice` in the config that cannot be used is announced at
+startup and the default voice is kept.
+
+A `voice_idx` line from an older TDSR config is still understood with its old
+meaning (`0` = en, `1` = en-us, `10` = mb-us1, ...), announced, and rewritten
+as `voice = ...` on first start. On macOS and with external speech servers,
+`voice_idx` remains the setting, see above.
+
+**MBROLA voices** use diphone synthesis and generally sound more natural than
+espeak-ng's formant voices. They need the `mbrola` program and one data package
+per voice. On Debian/Ubuntu:
+
+```bash
+sudo apt install mbrola mbrola-us1 mbrola-us2   # US English female / male
+```
+
+`espeak-ng --voices=mb` shows every MBROLA voice espeak-ng has a definition
+for; the package for `mb-xx1` is `mbrola-xx1`. Run `tdsr --list-voices` again
+after installing to see the new voice. MBROLA voices are synthesised at 16 kHz
+(espeak-ng's own at 22.05 kHz); TDSR follows the rate of the voice in use.
 
 **Quick speech test:**
 ```bash
@@ -353,9 +360,9 @@ Press `Alt+d` to run!
 - **PTY Management** - `portable-pty` for cross-platform PTY
 - **Screen Buffer** - 2D buffer for review cursor navigation
 - **Speech System** - Native TTS backends:
-  - Linux: Speech Dispatcher via `tts` crate, or PulseAudio + espeak-ng
+  - Linux: Speech Dispatcher (libspeechd), or espeak-ng in-process / via PulseAudio
   - WSL: PulseAudio + espeak-ng (WSLG), Windows SAPI fallback, Speech Dispatcher fallback
-  - macOS: AVFoundation, driven by a `tdsr --speech-server` subprocess (the `tts` crate is not used on macOS)
+  - macOS: AVFoundation, driven by a `tdsr --speech-server` subprocess
   - Optional: MBROLA voices for higher quality speech (Linux/WSL)
 - **Input Handling** - Modal key handler stack
 - **Plugin System** - JSON subprocess protocol

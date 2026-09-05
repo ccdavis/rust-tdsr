@@ -208,6 +208,11 @@ impl Config {
         self.ini.with_section(Some(section)).set(key, value);
     }
 
+    /// Remove a key (no-op if absent).
+    pub fn remove(&mut self, section: &str, key: &str) {
+        self.ini.delete_from(Some(section), key);
+    }
+
     /// Get a float value from config
     pub fn get_float(&self, section: &str, key: &str, default: f32) -> f32 {
         self.ini
@@ -313,6 +318,15 @@ impl Config {
     /// Voice index for TTS engine
     pub fn voice_idx(&self) -> Option<usize> {
         self.get_int("speech", "voice_idx", -1).try_into().ok()
+    }
+
+    /// Voice by persistent id (`[speech] voice`): an espeak-ng voice file
+    /// such as `gmw/en-US` or `mb/mb-us1`, or a Speech Dispatcher voice
+    /// name. Takes precedence over `voice_idx`.
+    pub fn voice(&self) -> Option<String> {
+        let v = self.get_string("speech", "voice", "");
+        let v = v.trim();
+        (!v.is_empty()).then(|| v.to_string())
     }
 
     /// External speech server command (`[speech] speech_command`), if set.

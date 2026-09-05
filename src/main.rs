@@ -99,12 +99,67 @@ fn main() {
         tdsr::speech::backends::avfoundation::list_voices();
     }
 
+    // List espeak-ng voices (Linux/WSL) and exit.
+    #[cfg(not(target_os = "macos"))]
+    if args.iter().any(|arg| arg == "--list-voices") {
+        list_espeak_voices();
+    }
+
     // Run the application and exit with the shell's status
     match run() {
         Ok(code) => process::exit(code),
         Err(e) => {
             error!("Fatal error: {}", e);
             eprintln!("tdsr: {}", e);
+            process::exit(1);
+        }
+    }
+}
+
+/// `tdsr --list-voices` on Linux/WSL: the voices of the backend `create_synth`
+/// would pick, with the index each has as `voice_idx`. On native Linux that
+/// is Speech Dispatcher when it answers; otherwise (and on WSL) the espeak-ng
+/// catalogue, from the in-process library when it loads, else the espeak-ng
+/// program.
+#[cfg(not(target_os = "macos"))]
+fn list_espeak_voices() -> ! {
+    use tdsr::speech::voices::VoiceCatalogue;
+
+    #[cfg(all(feature = "native-speech", not(target_os = "macos")))]
+    if !is_wsl() {
+        match tdsr::speech::backends::speechd::list_voices() {
+            Ok(listing) => {
+                print!("{}", listing);
+                process::exit(0);
+            }
+            Err(e) => debug!("Speech Dispatcher not usable for --list-voices ({})", e),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    let in_process = tdsr::speech::backends::espeak::list_voices();
+    #[cfg(not(target_os = "linux"))]
+    let in_process: Result<VoiceCatalogue> = Err("not linux".into());
+
+    let voices = in_process.or_else(|e| {
+        debug!(
+            "libespeak-ng not usable for --list-voices ({}); trying espeak-ng",
+            e
+        );
+        VoiceCatalogue::from_command("espeak-ng")
+    });
+    match voices {
+        Ok(v) if !v.is_empty() => {
+            print!("{}", v.render());
+            process::exit(0);
+        }
+        Ok(_) => {
+            eprintln!("tdsr: espeak-ng reported no voices (is espeak-ng-data installed?)");
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("tdsr: cannot list voices: {}", e);
+            eprintln!("Voice indices apply to the espeak-ng backends; install espeak-ng.");
             process::exit(1);
         }
     }

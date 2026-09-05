@@ -46,12 +46,16 @@
 //! source is open, so on WSL a keep-alive thread holds one for the life of
 //! the backend.
 //!
-//! Audio is delivered at 44100 Hz (see [`crate::speech::resample`]) so
-//! WSLg's low-quality resampler is not involved.
+//! Audio is delivered at twice espeak-ng's rate (see
+//! [`crate::speech::resample`]): 44100 Hz for espeak-ng's own voices, which
+//! is WSLg's sink rate, so its low-quality resampler is not involved. MBROLA
+//! voices are synthesised at 16000 Hz; the rate is re-read after every voice
+//! change and the stream (re)opened to match.
 
 use crate::platform::is_wsl;
-use crate::speech::backends::pulseaudio::{espeak_voice_name, setup_pulseaudio, wpm_for_rate};
+use crate::speech::backends::pulseaudio::{setup_pulseaudio, wpm_for_rate};
 use crate::speech::resample::Upsampler;
+use crate::speech::voices::{legacy_voice_name, EspeakVoice, Gender, VoiceCatalogue};
 use crate::speech::{SpeechCommand, Synth};
 use crate::{Result, TdsrError};
 use libloading::Library;
@@ -60,12 +64,14 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Sample rate delivered to PulseAudio (espeak-ng produces 22050 Hz).
+/// Rate of the keep-alive monitor stream, and of playback for espeak-ng's
+/// own voices (22050 Hz, upsampled 2x). Playback runs at twice whatever the
+/// current voice produces.
 const OUTPUT_RATE: u32 = 44100;
 
 /// Length of the PCM chunks espeak-ng hands to the callback.
@@ -89,6 +95,18 @@ const BACKLOG_CHECK_MS: u32 = 250;
 /// level it is brought back to.
 const BACKLOG_LIMIT_MS: u64 = 200;
 const BACKLOG_TARGET_MS: u64 = 100;
+
+/// Voice used until the config selects one.
+const DEFAULT_VOICE: &str = "en";
+
+/// How long `set_voice` waits for the audio thread to load a voice and
+/// answer (loading an MBROLA voice starts `mbrola` and handshakes with it).
+const VOICE_APPLY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Native Linux only: how long the playback stream stays open after the last
+/// sound before it is closed. Closing rewinds the sink there, so it is not
+/// done per pause as on WSL.
+const IDLE_CLOSE: Duration = Duration::from_millis(500);
 
 /// Granularity of cancellable waits.
 const SLEEP_STEP: Duration = Duration::from_millis(10);
@@ -126,6 +144,25 @@ type EspeakSynthFn = unsafe extern "C" fn(
 type EspeakSetParameter = unsafe extern "C" fn(c_int, c_int, c_int) -> c_int;
 type EspeakSetVoiceByName = unsafe extern "C" fn(*const c_char) -> c_int;
 type EspeakTerminate = unsafe extern "C" fn() -> c_int;
+type EspeakListVoices = unsafe extern "C" fn(*const EspeakVoiceRaw) -> *const *const EspeakVoiceRaw;
+type EspeakNgGetSampleRate = unsafe extern "C" fn() -> c_int;
+type EspeakInfo = unsafe extern "C" fn(*mut *const c_char) -> *const c_char;
+
+/// `espeak_VOICE` from espeak_lib.h.
+#[repr(C)]
+struct EspeakVoiceRaw {
+    name: *const c_char,
+    /// Packed list of (priority byte, NUL-terminated language) pairs,
+    /// terminated by a zero priority byte.
+    languages: *const c_char,
+    identifier: *const c_char,
+    gender: u8,
+    age: u8,
+    variant: u8,
+    xx1: u8,
+    score: c_int,
+    spare: *mut c_void,
+}
 
 /// The espeak-ng library. Not thread-safe: used only by the audio thread.
 struct Espeak {
@@ -134,7 +171,12 @@ struct Espeak {
     set_parameter: EspeakSetParameter,
     set_voice_by_name: EspeakSetVoiceByName,
     terminate: EspeakTerminate,
-    /// Rate of the PCM it produces
+    list_voices: EspeakListVoices,
+    info: EspeakInfo,
+    /// Not in every espeak-ng build; without it the rate reported at
+    /// initialisation is assumed for every voice.
+    get_sample_rate: Option<EspeakNgGetSampleRate>,
+    /// Rate of the PCM it produces with the current voice
     sample_rate: u32,
 }
 
@@ -162,6 +204,14 @@ impl Espeak {
             let terminate = *lib
                 .get::<EspeakTerminate>(b"espeak_Terminate\0")
                 .map_err(err)?;
+            let list_voices = *lib
+                .get::<EspeakListVoices>(b"espeak_ListVoices\0")
+                .map_err(err)?;
+            let get_sample_rate = lib
+                .get::<EspeakNgGetSampleRate>(b"espeak_ng_GetSampleRate\0")
+                .ok()
+                .map(|f| *f);
+            let info = *lib.get::<EspeakInfo>(b"espeak_Info\0").map_err(err)?;
 
             let rate = initialize(
                 AUDIO_OUTPUT_SYNCHRONOUS,
@@ -181,18 +231,111 @@ impl Espeak {
                 set_parameter,
                 set_voice_by_name,
                 terminate,
+                list_voices,
+                info,
+                get_sample_rate,
                 sample_rate: rate as u32,
             })
         }
     }
 
-    fn set_voice(&self, name: &str) {
-        if let Ok(c) = CString::new(name) {
-            // SAFETY: valid NUL-terminated string, library initialised.
-            if unsafe { (self.set_voice_by_name)(c.as_ptr()) } != 0 {
-                warn!("espeak-ng voice '{}' not available", name);
+    /// Select a voice by name or identifier (`gmw/en-US`, `mb/mb-us1`).
+    /// Returns false if espeak-ng could not load it; the library's current
+    /// voice is then undefined, so the caller should select another.
+    fn set_voice(&mut self, name: &str) -> bool {
+        let Ok(c) = CString::new(name) else {
+            return false;
+        };
+        // SAFETY: valid NUL-terminated string, library initialised.
+        let ok = unsafe { (self.set_voice_by_name)(c.as_ptr()) } == 0;
+        if ok {
+            if let Some(get) = self.get_sample_rate {
+                // SAFETY: library initialised.
+                let rate = unsafe { get() };
+                if rate > 0 {
+                    self.sample_rate = rate as u32;
+                }
+            }
+        } else {
+            warn!("espeak-ng voice '{}' not available", name);
+        }
+        ok
+    }
+
+    /// espeak-ng's data directory (where it looks for MBROLA databases
+    /// first).
+    fn data_path(&self) -> Option<String> {
+        let mut path: *const c_char = ptr::null();
+        // SAFETY: library initialised; espeak_Info stores a pointer to its
+        // own static path string.
+        unsafe {
+            (self.info)(&mut path);
+            if path.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr(path).to_string_lossy().into_owned())
             }
         }
+    }
+
+    /// Every voice espeak-ng knows: its own, then the MBROLA definitions.
+    fn voices(&self) -> VoiceCatalogue {
+        // SAFETY: library initialised; the list is read and copied before
+        // the next call, which frees it.
+        let native = unsafe { self.read_voice_list(ptr::null()) };
+        let spec = EspeakVoiceRaw {
+            name: ptr::null(),
+            languages: b"mb\0".as_ptr() as *const c_char,
+            identifier: ptr::null(),
+            gender: 0,
+            age: 0,
+            variant: 0,
+            xx1: 0,
+            score: 0,
+            spare: ptr::null_mut(),
+        };
+        // SAFETY: as above; `spec` outlives the call.
+        let mbrola = unsafe { self.read_voice_list(&spec) };
+        VoiceCatalogue::new(native, mbrola, self.data_path().as_deref())
+    }
+
+    /// Copy the NULL-terminated list `espeak_ListVoices(spec)` returns.
+    unsafe fn read_voice_list(&self, spec: *const EspeakVoiceRaw) -> Vec<EspeakVoice> {
+        let cstr = |p: *const c_char| -> String {
+            if p.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        };
+        let mut out = Vec::new();
+        let list = (self.list_voices)(spec);
+        if list.is_null() {
+            return out;
+        }
+        let mut i = 0;
+        loop {
+            let v = *list.add(i);
+            if v.is_null() {
+                break;
+            }
+            let v = &*v;
+            // First language entry: a priority byte, then the tag.
+            let language = if v.languages.is_null() || *v.languages == 0 {
+                String::new()
+            } else {
+                cstr(v.languages.add(1))
+            };
+            out.push(EspeakVoice {
+                name: cstr(v.name),
+                identifier: cstr(v.identifier),
+                language,
+                gender: Gender::from_code(v.gender),
+                installed: false,
+            });
+            i += 1;
+        }
+        out
     }
 
     fn set_rate(&self, wpm: u16) {
@@ -496,13 +639,21 @@ struct Utterance {
 struct Settings {
     rate: u8,
     volume: u8,
-    voice: String,
+}
+
+/// A voice change; the event loop waits for the answer.
+struct VoiceRequest {
+    /// Name or identifier for `espeak_SetVoiceByName`
+    id: String,
+    /// The sample rate of the new voice, or why it could not be loaded
+    reply: mpsc::Sender<std::result::Result<u32, String>>,
 }
 
 struct Queue {
     items: VecDeque<Utterance>,
     settings: Settings,
     settings_changed: bool,
+    voice_request: Option<VoiceRequest>,
 }
 
 struct Shared {
@@ -511,12 +662,23 @@ struct Shared {
     /// Abort the current utterance and drop what is buffered
     cancel: AtomicBool,
     shutdown: AtomicBool,
+    /// Rate espeak-ng produces with the voice in use (0 until known).
+    sample_rate: AtomicU32,
 }
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, Queue> {
         self.queue.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// What the audio thread does next.
+enum Job {
+    Voice(VoiceRequest),
+    /// An utterance, with new rate/volume to apply first
+    Speak(Utterance, Option<Settings>),
+    /// Nothing queued for a while: close the idle stream (native Linux)
+    Idle,
 }
 
 // ---- audio thread ---------------------------------------------------------
@@ -613,26 +775,46 @@ impl Player {
         self.flush_silence(false) && self.check_backlog() && self.write(samples)
     }
 
-    /// Deliver the silence seen so far: as a closed-stream gap if it is a
-    /// real pause (or the end of the utterance), as samples if it is short.
+    /// Deliver the silence seen so far. On WSL a real pause (or the end of
+    /// the utterance) becomes a closed-stream gap so nothing is sent while
+    /// nothing sounds; short silences, and all silence on native Linux, are
+    /// written as samples so the cadence is exactly espeak-ng's.
     fn flush_silence(&mut self, end: bool) -> bool {
         let n = std::mem::take(&mut self.pending_silence);
         if n == 0 {
             return true;
         }
         let ms = (n as u64 * 1000 / self.in_rate as u64) as u32;
-        if end || ms >= GAP_MIN_MS {
+        if self.wsl && (end || ms >= GAP_MIN_MS) {
             self.gap(ms as u64)
         } else {
-            let zeros = vec![0i16; n];
-            self.write(&zeros)
+            self.write_silence(n)
         }
+    }
+
+    /// Write `n` silent samples in 20 ms slices, stopping on cancel.
+    fn write_silence(&mut self, n: usize) -> bool {
+        let slice = (self.in_rate as usize / 50).max(1);
+        let zeros = vec![0i16; slice];
+        let mut left = n;
+        while left > 0 {
+            if self.cancelled() {
+                return false;
+            }
+            let take = left.min(slice);
+            if !self.write(&zeros[..take]) {
+                return false;
+            }
+            left -= take;
+        }
+        true
     }
 
     fn write(&mut self, samples: &[i16]) -> bool {
         if self.stream.is_none() {
-            match self.pulse.open_playback(OUTPUT_RATE) {
+            match self.pulse.open_playback(self.in_rate * 2) {
                 Ok(s) => {
+                    debug!("Playback stream open at {} Hz", self.in_rate * 2);
                     self.stream = Some(s);
                     self.upsampler.reset();
                 }
@@ -685,10 +867,9 @@ impl Player {
         }
     }
 
-    /// A pause of `ms`: let the buffered sound finish, close the stream, and
-    /// wait out the remainder. Returns false if cancelled meanwhile.
-    fn gap(&mut self, ms: u64) -> bool {
-        let start = Instant::now();
+    /// Let the buffered sound finish, then close the stream. Returns false
+    /// if cancelled meanwhile (the stream is then flushed by `abort`).
+    fn close_after_playout(&mut self) -> bool {
         if self.stream.is_some() {
             let delay = self.close_delay_ms();
             if !self.wait(delay) {
@@ -697,25 +878,37 @@ impl Player {
             self.stream = None;
             self.sent_since_check_ms = 0;
         }
-        let elapsed = start.elapsed().as_millis() as u64;
-        ms <= elapsed || self.wait(ms - elapsed)
+        true
     }
 
-    /// After an utterance completed: play out its trailing pause (as a gap)
-    /// and close the stream.
+    /// A pause of `ms` (WSL): let the buffered sound finish, close the
+    /// stream, and only then wait out the pause, so the pause is heard in
+    /// full after the sound. Returns false if cancelled meanwhile.
+    fn gap(&mut self, ms: u64) -> bool {
+        self.close_after_playout() && self.wait(ms)
+    }
+
+    /// After an utterance completed: play out its trailing pause. On WSL
+    /// the stream is closed as well (it must not stay open while silent);
+    /// on native Linux it stays open for the next utterance and is closed
+    /// by `close_idle` once nothing has been queued for a while.
     fn finish(&mut self) {
         if !self.flush_silence(true) {
             self.abort();
             return;
         }
-        if self.stream.is_some() {
-            // Ended in sound (a letter): let it finish, then close.
-            let delay = self.close_delay_ms();
-            if !self.wait(delay) {
-                self.abort();
-                return;
-            }
-            self.stream = None;
+        if self.wsl && !self.close_after_playout() {
+            self.abort();
+            return;
+        }
+        self.sent_since_check_ms = 0;
+    }
+
+    /// Close a stream that has been idle (native Linux). Everything in it
+    /// has played by now, so nothing is lost.
+    fn close_idle(&mut self) {
+        if self.stream.take().is_some() {
+            debug!("Playback stream closed after idle");
         }
         self.sent_since_check_ms = 0;
     }
@@ -730,11 +923,12 @@ impl Player {
     }
 }
 
-/// What the audio thread reports back to `new`.
-type InitResult = std::result::Result<Arc<Pulse>, TdsrError>;
+/// What the audio thread reports back to `new`: the server connection and
+/// the voices espeak-ng offers.
+type InitResult = std::result::Result<(Arc<Pulse>, VoiceCatalogue), TdsrError>;
 
 fn audio_thread(shared: Arc<Shared>, ready: mpsc::Sender<InitResult>) {
-    let espeak = match Espeak::load(synth_callback) {
+    let mut espeak = match Espeak::load(synth_callback) {
         Ok(e) => e,
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -753,7 +947,7 @@ fn audio_thread(shared: Arc<Shared>, ready: mpsc::Sender<InitResult>) {
         let _ = ready.send(Err(e));
         return;
     }
-    let _ = ready.send(Ok(Arc::clone(&pulse)));
+    let _ = ready.send(Ok((Arc::clone(&pulse), espeak.voices())));
 
     let mut player = Player {
         pulse,
@@ -766,37 +960,92 @@ fn audio_thread(shared: Arc<Shared>, ready: mpsc::Sender<InitResult>) {
         last_warning: None,
         wsl: is_wsl(),
     };
+    // The voice espeak-ng currently has loaded (its default until told
+    // otherwise).
+    let mut applied_voice = DEFAULT_VOICE.to_string();
+    espeak.set_voice(&applied_voice);
+    player.in_rate = espeak.sample_rate;
+    shared
+        .sample_rate
+        .store(espeak.sample_rate, Ordering::SeqCst);
 
     loop {
-        let utterance = {
+        // Pick the next job under the lock; everything that takes time
+        // (loading a voice, synthesis) happens after the lock is released,
+        // so the event loop's own calls never wait on it.
+        let job = {
             let mut q = shared.lock();
-            while q.items.is_empty() && !shared.shutdown.load(Ordering::SeqCst) {
-                q = shared.wake.wait(q).unwrap_or_else(|e| e.into_inner());
+            loop {
+                if shared.shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Some(req) = q.voice_request.take() {
+                    break Job::Voice(req);
+                }
+                if let Some(utterance) = q.items.pop_front() {
+                    let settings = q.settings_changed.then(|| q.settings.clone());
+                    q.settings_changed = false;
+                    // Everything a cancel referred to has been removed from
+                    // the queue by now, so it is safe to arm this utterance.
+                    shared.cancel.store(false, Ordering::SeqCst);
+                    break Job::Speak(utterance, settings);
+                }
+                if player.stream.is_some() {
+                    let (guard, timeout) = shared
+                        .wake
+                        .wait_timeout(q, IDLE_CLOSE)
+                        .unwrap_or_else(|e| e.into_inner());
+                    q = guard;
+                    if timeout.timed_out() && q.items.is_empty() && q.voice_request.is_none() {
+                        break Job::Idle;
+                    }
+                } else {
+                    q = shared.wake.wait(q).unwrap_or_else(|e| e.into_inner());
+                }
             }
-            if shared.shutdown.load(Ordering::SeqCst) {
-                return;
-            }
-            if q.settings_changed {
-                espeak.set_voice(&q.settings.voice);
-                espeak.set_rate(wpm_for_rate(q.settings.rate));
-                espeak.set_volume(q.settings.volume);
-                q.settings_changed = false;
-            }
-            // Everything a cancel referred to has been removed from the
-            // queue by now, so it is safe to arm the next utterance.
-            shared.cancel.store(false, Ordering::SeqCst);
-            q.items.pop_front()
         };
-        let Some(utterance) = utterance else { continue };
 
-        PLAYER.with(|p| p.set(&mut player as *mut Player));
-        espeak.synth(&utterance.text, !utterance.is_letter);
-        PLAYER.with(|p| p.set(ptr::null_mut()));
+        match job {
+            Job::Idle => player.close_idle(),
+            Job::Voice(req) => {
+                let old_rate = espeak.sample_rate;
+                let ok = espeak.set_voice(&req.id);
+                if ok {
+                    applied_voice = req.id.clone();
+                } else {
+                    // Loading failed part-way; put the last good voice
+                    // back so speech keeps working.
+                    espeak.set_voice(&applied_voice);
+                }
+                player.in_rate = espeak.sample_rate;
+                shared
+                    .sample_rate
+                    .store(espeak.sample_rate, Ordering::SeqCst);
+                if espeak.sample_rate != old_rate {
+                    // An open stream has the old rate
+                    player.abort();
+                }
+                let _ = req.reply.send(if ok {
+                    Ok(espeak.sample_rate)
+                } else {
+                    Err(format!("espeak-ng could not load the voice {}", req.id))
+                });
+            }
+            Job::Speak(utterance, settings) => {
+                if let Some(s) = settings {
+                    espeak.set_rate(wpm_for_rate(s.rate));
+                    espeak.set_volume(s.volume);
+                }
+                PLAYER.with(|p| p.set(&mut player as *mut Player));
+                espeak.synth(&utterance.text, !utterance.is_letter);
+                PLAYER.with(|p| p.set(ptr::null_mut()));
 
-        if player.cancelled() {
-            player.abort();
-        } else {
-            player.finish();
+                if player.cancelled() {
+                    player.abort();
+                } else {
+                    player.finish();
+                }
+            }
         }
     }
 }
@@ -828,6 +1077,25 @@ fn keepalive_thread(pulse: Arc<Pulse>, shared: Arc<Shared>) {
 /// espeak-ng speech with TDSR-managed PulseAudio playback.
 pub struct EspeakSynth {
     shared: Arc<Shared>,
+    voices: VoiceCatalogue,
+    audio_thread: Option<thread::JoinHandle<()>>,
+}
+
+/// How long `drop` waits for the audio thread to shut the library down.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The voices the in-process backend offers, loaded on the calling thread
+/// (for `tdsr --list-voices`). Fails if the library cannot be loaded.
+///
+/// The library is deliberately never terminated: espeak-ng's
+/// `espeak_Terminate` can wait forever for its internal thread when called
+/// soon after `espeak_Initialize` (a lost wake-up in its event thread), and
+/// the caller exits the process right after this anyway.
+pub fn list_voices() -> Result<VoiceCatalogue> {
+    let espeak = Espeak::load(synth_callback)?;
+    let voices = espeak.voices();
+    std::mem::forget(espeak);
+    Ok(voices)
 }
 
 impl EspeakSynth {
@@ -841,24 +1109,25 @@ impl EspeakSynth {
                 settings: Settings {
                     rate: 50,
                     volume: 80,
-                    voice: "en".to_string(),
                 },
                 settings_changed: true,
+                voice_request: None,
             }),
             wake: Condvar::new(),
             cancel: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            sample_rate: AtomicU32::new(0),
         });
 
         let (tx, rx) = mpsc::channel();
         let worker_shared = Arc::clone(&shared);
-        thread::Builder::new()
+        let audio_thread = thread::Builder::new()
             .name("tdsr-audio".to_string())
             .spawn(move || audio_thread(worker_shared, tx))
             .map_err(|e| TdsrError::Speech(format!("Failed to start audio thread: {}", e)))?;
 
-        let pulse = match rx.recv_timeout(INIT_TIMEOUT) {
-            Ok(Ok(pulse)) => pulse,
+        let (pulse, voices) = match rx.recv_timeout(INIT_TIMEOUT) {
+            Ok(Ok(ready)) => ready,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 shared.shutdown.store(true, Ordering::SeqCst);
@@ -878,8 +1147,15 @@ impl EspeakSynth {
             }
         }
 
-        info!("espeak-ng in-process backend ready");
-        Ok(Self { shared })
+        info!(
+            "espeak-ng in-process backend ready ({} voices)",
+            voices.len()
+        );
+        Ok(Self {
+            shared,
+            voices,
+            audio_thread: Some(audio_thread),
+        })
     }
 
     fn enqueue(&self, text: &str, is_letter: bool) {
@@ -900,6 +1176,43 @@ impl EspeakSynth {
         let mut q = self.shared.lock();
         f(&mut q.settings);
         q.settings_changed = true;
+    }
+
+    /// The voices this backend offers.
+    pub fn voices(&self) -> &VoiceCatalogue {
+        &self.voices
+    }
+
+    /// Rate espeak-ng is producing with the voice in use; 0 until the
+    /// audio thread has selected one.
+    pub fn sample_rate(&self) -> u32 {
+        self.shared.sample_rate.load(Ordering::SeqCst)
+    }
+
+    /// Have the audio thread load `id` now (interrupting what is playing)
+    /// and wait for espeak-ng's verdict.
+    fn apply_voice(&self, id: &str) -> Result<u32> {
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut q = self.shared.lock();
+            q.voice_request = Some(VoiceRequest {
+                id: id.to_string(),
+                reply: tx,
+            });
+        }
+        self.shared.cancel.store(true, Ordering::SeqCst);
+        self.shared.wake.notify_one();
+        match rx.recv_timeout(VOICE_APPLY_TIMEOUT) {
+            Ok(Ok(rate)) => Ok(rate),
+            Ok(Err(msg)) => Err(TdsrError::Speech(msg)),
+            Err(_) => {
+                // Withdraw the request so it is not applied later, unnoticed
+                self.shared.lock().voice_request.take();
+                Err(TdsrError::Speech(
+                    "the speech thread did not answer, voice unchanged".to_string(),
+                ))
+            }
+        }
     }
 }
 
@@ -928,10 +1241,46 @@ impl Synth for EspeakSynth {
     }
 
     fn set_voice_idx(&mut self, idx: usize) -> Result<()> {
-        let voice = espeak_voice_name(idx);
-        debug!("Setting voice to {} (index {})", voice, idx);
-        self.update_settings(|s| s.voice = voice.to_string());
-        Ok(())
+        let id = self.voices.select(idx)?.identifier.clone();
+        self.set_voice(&id).map(|_| ())
+    }
+
+    /// Select by identifier (`gmw/en-US`, `mb/mb-us1`) or any name espeak-ng
+    /// accepts. A catalogue voice known to be missing its MBROLA data is
+    /// refused up front (espeak-ng and mbrola would print complaints to the
+    /// terminal); otherwise espeak-ng's own answer decides.
+    fn set_voice(&mut self, id: &str) -> Result<String> {
+        let (ident, name) = match self.voices.find(id) {
+            Some(v) => {
+                self.voices.check_usable(v)?;
+                (v.identifier.clone(), v.describe())
+            }
+            None => (id.trim().to_string(), id.trim().to_string()),
+        };
+        debug!("Setting voice to {}", ident);
+        let rate = self.apply_voice(&ident)?;
+        debug!("Voice {} loaded, {} Hz", ident, rate);
+        Ok(name)
+    }
+
+    fn voice_count(&self) -> Option<usize> {
+        Some(self.voices.len())
+    }
+
+    fn voice_id(&self, idx: usize) -> Option<String> {
+        self.voices.get(idx).map(|v| v.identifier.clone())
+    }
+
+    /// Before the catalogue, `voice_idx` indexed a fixed table of espeak-ng
+    /// voice names.
+    fn legacy_voice_id(&self, idx: usize) -> Option<String> {
+        let name = legacy_voice_name(idx)?;
+        Some(
+            self.voices
+                .find(name)
+                .map(|v| v.identifier.clone())
+                .unwrap_or_else(|| name.to_string()),
+        )
     }
 
     fn speak(&mut self, text: &str) -> Result<()> {
@@ -966,6 +1315,19 @@ impl Drop for EspeakSynth {
         self.shared.cancel.store(true, Ordering::SeqCst);
         self.shared.lock().items.clear();
         self.shared.wake.notify_all();
+        // Let the thread terminate the library, but never hang exit on a
+        // server that stopped answering.
+        if let Some(handle) = self.audio_thread.take() {
+            let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+            while !handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(SLEEP_STEP);
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                warn!("Audio thread did not stop in time; leaving it");
+            }
+        }
     }
 }
 
@@ -973,24 +1335,65 @@ impl Drop for EspeakSynth {
 mod tests {
     use super::*;
 
+    /// Only one test may load libespeak-ng: it is process-global, not
+    /// thread-safe, and its `espeak_Terminate` can hang when another
+    /// initialisation races it. So the backend is created once here and
+    /// everything that needs the library is checked in this test.
+    ///
+    /// MBROLA voices are synthesised at 16000 Hz, espeak-ng's own at 22050;
+    /// the rate must follow the voice, and a voice change is synchronous.
     #[test]
-    fn playback_buffer_attr_is_small_and_starts_immediately() {
-        let attr = PaBufferAttr {
-            maxlength: PA_INVALID,
-            tlength: OUTPUT_RATE * 2 * TARGET_BUFFER_MS / 1000,
-            prebuf: 0,
-            minreq: PA_INVALID,
-            fragsize: PA_INVALID,
+    fn backend_lists_voices_and_follows_their_sample_rate() {
+        let mut synth = match EspeakSynth::new() {
+            Ok(s) => s,
+            Err(e) => {
+                println!("⚠ espeak-ng in-process backend not available: {}", e);
+                return;
+            }
         };
-        assert_eq!(attr.tlength, 3528); // 40 ms of s16 mono at 44100 Hz
-        assert_eq!(attr.prebuf, 0);
-    }
+        let voices = synth.voices().clone();
+        assert!(voices.len() > 10, "{} voices", voices.len());
+        assert!(voices.get(0).unwrap().installed);
+        let index_of = |id: &str| {
+            voices
+                .iter()
+                .find(|(_, v)| v.identifier == id)
+                .map(|(i, _)| i)
+        };
+        let en_us = index_of("gmw/en-US").expect("espeak-ng ships gmw/en-US");
+        assert_eq!(synth.voice_id(en_us).as_deref(), Some("gmw/en-US"));
+        assert_eq!(synth.legacy_voice_id(1).as_deref(), Some("gmw/en-US"));
+        assert_eq!(synth.legacy_voice_id(10).as_deref(), Some("mb/mb-us1"));
+        assert!(synth.legacy_voice_id(14).is_none());
+        assert!(synth.set_voice_idx(voices.len()).is_err());
 
-    #[test]
-    fn create_backend_if_available() {
-        match EspeakSynth::new() {
-            Ok(_) => println!("✓ espeak-ng in-process backend available"),
-            Err(e) => println!("⚠ espeak-ng in-process backend not available: {}", e),
+        assert_eq!(synth.set_voice("gmw/en-US").unwrap(), "English (America)");
+        assert_eq!(synth.sample_rate(), 22050);
+        assert_eq!(synth.set_voice("en-us").unwrap(), "English (America)");
+        // espeak-ng's own verdict on a name the catalogue does not have
+        assert!(synth.set_voice("gmw/no-such-voice").is_err());
+        assert_eq!(synth.sample_rate(), 22050, "previous voice kept");
+        synth.letter("a").unwrap();
+
+        match index_of("mb/mb-us1").filter(|&i| voices.get(i).unwrap().installed) {
+            Some(us1) => {
+                synth.set_voice_idx(us1).unwrap();
+                assert_eq!(synth.sample_rate(), 16000);
+                synth.letter("b").unwrap();
+                assert_eq!(synth.set_voice("mb/mb-us1").unwrap(), "us-mbrola-1, MBROLA");
+                assert_eq!(synth.set_voice("gmw/en-US").unwrap(), "English (America)");
+                assert_eq!(synth.sample_rate(), 22050);
+                synth.letter("c").unwrap();
+            }
+            None => println!("⚠ MBROLA us1 not installed; rate change not exercised"),
         }
+        // A definition whose database is missing is refused up front.
+        if let Some((idx, _)) = voices.iter().find(|(_, v)| v.is_mbrola() && !v.installed) {
+            let err = synth.set_voice_idx(idx).unwrap_err().to_string();
+            assert!(err.contains("not installed"), "{}", err);
+        }
+        // Let the letters play (settings are applied on the audio thread)
+        thread::sleep(Duration::from_millis(300));
+        synth.cancel().unwrap();
     }
 }

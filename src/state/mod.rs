@@ -11,7 +11,7 @@ use crate::plugins::PluginManager;
 use crate::review::ReviewCursor;
 use crate::speech::{SpeechBuffer, Synth};
 use crate::terminal::Screen;
-use crate::Result;
+use crate::{Result, TdsrError};
 use config::Config;
 use log::{info, warn};
 use phonetics::PHONETICS;
@@ -146,10 +146,8 @@ impl State {
             synth.set_volume(volume)?;
             info!("Speech volume set to {}", volume);
         }
-        if let Some(voice_idx) = config.voice_idx() {
-            synth.set_voice_idx(voice_idx)?;
-            info!("Speech voice index set to {}", voice_idx);
-        }
+        let mut config = config;
+        let startup_warning = Self::apply_configured_voice(&mut config, synth.as_mut());
 
         // Initialize plugin manager if plugins are configured
         let plugin_manager = if !config.plugins.is_empty() {
@@ -184,7 +182,7 @@ impl State {
         };
 
         let (tx, rx) = mpsc::channel();
-        Ok(Self {
+        let mut state = Self {
             config,
             review: ReviewCursor::new(cols, rows),
             synth,
@@ -203,7 +201,63 @@ impl State {
             plugin_results: rx,
             plugin_sender: tx,
             plugins_running: 0,
-        })
+        };
+        if let Some(msg) = startup_warning {
+            state.speak(&msg)?;
+        }
+        Ok(state)
+    }
+
+    /// Apply the configured voice. `voice` (a persistent id) wins; a bare
+    /// `voice_idx` is either a legacy index on a backend whose numbering
+    /// changed, which is migrated to `voice`, or the only handle an
+    /// index-only backend has. A voice that cannot be used is not fatal:
+    /// the default voice is kept and the reason returned to be spoken.
+    fn apply_configured_voice(config: &mut Config, synth: &mut dyn Synth) -> Option<String> {
+        let reason = |e: &TdsrError| match e {
+            TdsrError::Speech(msg) => msg.clone(),
+            other => other.to_string(),
+        };
+        if let Some(id) = config.voice() {
+            return match synth.set_voice(&id) {
+                Ok(name) => {
+                    info!("Speech voice set to {} ({})", id, name);
+                    None
+                }
+                Err(e) => {
+                    warn!("voice {} from config not applied: {}", id, e);
+                    Some(format!("Configured voice {} not used: {}", id, reason(&e)))
+                }
+            };
+        }
+        let idx = config.voice_idx()?;
+        match synth.legacy_voice_id(idx) {
+            Some(id) => match synth.set_voice(&id) {
+                Ok(name) => {
+                    info!("voice_idx {} migrated to voice {} ({})", idx, id, name);
+                    config.set("speech", "voice", &id);
+                    config.remove("speech", "voice_idx");
+                    if let Err(e) = config.save() {
+                        warn!("Could not save migrated voice setting: {}", e);
+                    }
+                    Some(format!("voice setting updated to {}", name))
+                }
+                Err(e) => {
+                    warn!("legacy voice_idx {} ({}) not applied: {}", idx, id, e);
+                    Some(format!("Configured voice {} not used: {}", idx, reason(&e)))
+                }
+            },
+            None => match synth.set_voice_idx(idx) {
+                Ok(()) => {
+                    info!("Speech voice index set to {}", idx);
+                    None
+                }
+                Err(e) => {
+                    warn!("voice_idx {} from config not applied: {}", idx, e);
+                    Some(format!("Configured voice {} not used: {}", idx, reason(&e)))
+                }
+            },
+        }
     }
 
     /// Save configuration to disk

@@ -15,12 +15,12 @@ name = "tdsr"
 path = "src/main.rs"
 
 [features]
-# The `native-speech` feature pulls in the `tts` crate (Speech Dispatcher on
-# Linux). It is on by default. Build with `--no-default-features` to omit it,
+# The `native-speech` feature pulls in the `speech-dispatcher` crate (libspeechd
+# bindings). It is on by default. Build with `--no-default-features` to omit it,
 # e.g. on distros whose speech-dispatcher is too old to compile (Ubuntu 20.04);
-# such builds use the PulseAudio + espeak-ng backend on Linux.
+# such builds use the espeak-ng backends on Linux.
 default = ["native-speech"]
-native-speech = ["dep:tts"]
+native-speech = ["dep:speech-dispatcher"]
 
 [dependencies]
 # Terminal emulation
@@ -61,16 +61,15 @@ dirs = "5.0"
 
 # Platform-specific dependencies
 
-# Text-to-speech via the `tts` crate (Speech Dispatcher on Linux and other
-# Unixes). Optional: enabling it requires libspeechd-dev >= 0.10 at build time.
-# Disable with --no-default-features on older distros (e.g. Ubuntu 20.04, which
-# ships speech-dispatcher 0.9.1) to build an espeak-ng-only binary.
+# Speech Dispatcher client (libspeechd bindings, see speech/backends/speechd.rs).
+# Optional: enabling it requires libspeechd-dev >= 0.10 and libclang at build
+# time. Disable with --no-default-features on older distros (e.g. Ubuntu 20.04,
+# which ships speech-dispatcher 0.9.1) to build an espeak-ng-only binary.
 #
-# Not used on macOS: the in-process AVFoundation path only plays the first
-# utterance because the main thread never services a CFRunLoop. macOS uses the
-# speech-server subprocess in speech/backends/avfoundation.rs exclusively.
+# Not used on macOS, which uses the speech-server subprocess in
+# speech/backends/avfoundation.rs exclusively.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-tts = { version = "0.26", optional = true }
+speech-dispatcher = { version = "0.16", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # AVFoundation speech server (see speech/backends/avfoundation.rs): the binary

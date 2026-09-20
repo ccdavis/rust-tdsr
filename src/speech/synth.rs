@@ -87,6 +87,14 @@ pub trait Synth: Send {
 
     /// Cancel/silence current speech
     fn cancel(&mut self) -> Result<()>;
+
+    /// Switch to the backend's other speech engine (alt+s) and return its
+    /// spoken name. Only the ALSA backend has more than one.
+    fn next_engine(&mut self) -> Result<String> {
+        Err(crate::TdsrError::Speech(
+            "this speech backend has one engine".to_string(),
+        ))
+    }
 }
 
 /// Try the in-process espeak-ng backend (Linux and WSL only).
@@ -134,7 +142,55 @@ fn try_espeak_in_process() -> Option<Box<dyn Synth>> {
 ///
 /// All backends provide helpful error messages when unavailable.
 pub fn create_synth(speech_command: Option<&str>) -> Result<Box<dyn Synth>> {
+    create_synth_with(speech_command, None)
+}
+
+/// [`create_synth`] with the config's backend choice: `[speech] backend =
+/// alsa` (or `TDSR_BACKEND=alsa`) selects the in-process ALSA backend with
+/// its `[speech]` options; anything else takes the platform chain.
+pub fn create_synth_for(
+    config: &crate::state::config::Config,
+    speech_command: Option<&str>,
+) -> Result<Box<dyn Synth>> {
+    let backend = std::env::var("TDSR_BACKEND")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| config.backend());
+    create_synth_with(speech_command, backend.as_deref().map(|b| (b, config)))
+}
+
+fn create_synth_with(
+    speech_command: Option<&str>,
+    backend: Option<(&str, &crate::state::config::Config)>,
+) -> Result<Box<dyn Synth>> {
     let platform = std::env::consts::OS;
+
+    if let Some((name, config)) = backend {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "alsa" => {
+                #[cfg(target_os = "linux")]
+                {
+                    info!("Using the ALSA in-process backend");
+                    let opts = config.alsa_options();
+                    return Ok(Box::new(super::backends::alsa::AlsaSynth::new(opts)?));
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = config;
+                    return Err(crate::TdsrError::Speech(
+                        "the alsa backend is only available on Linux".to_string(),
+                    ));
+                }
+            }
+            "auto" | "" => {}
+            other => {
+                return Err(crate::TdsrError::Speech(format!(
+                    "unknown speech backend '{}' (use alsa or auto)",
+                    other
+                )))
+            }
+        }
+    }
 
     if let Some(cmd) = speech_command {
         info!("Using external speech server: {}", cmd);

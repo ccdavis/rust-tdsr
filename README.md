@@ -23,7 +23,7 @@ Also, it's nice to have a single binary to deploy wherever you need a talking te
 ## Screen Reader Features
 
 - ✅ **Review Cursor Navigation** - Navigate screen content independently of the terminal cursor
-- ✅ **Speech Synthesis** - Platform-native speech (macOS AVFoundation, Linux Speech Dispatcher)
+- ✅ **Speech Synthesis** - Platform-native speech (macOS AVFoundation, Linux Speech Dispatcher), or in-process espeak-ng and DECtalk straight to ALSA
 - ✅ **Symbol Processing** - Convert special characters to words ("!" → "bang", "$" → "dollar")
 - ✅ **Copy/Selection** - Copy lines, screen content, or selected regions to clipboard
 - ✅ **Plugin System** - Extend functionality with external scripts (Python, shell, etc.)
@@ -158,6 +158,28 @@ tui_apps = fp,mc    # Programs (process names) that always get TUI mode
 tui_settle = 30     # Milliseconds of quiet before the screen is compared
 tui_announce = true # Say "TUI mode on/off" when it switches
 ```
+
+### ALSA backend: in-process engines, no sound server (Linux)
+
+For a machine with no PulseAudio or PipeWire, such as a console-only system or the
+[Talking Alpine](https://github.com/ccdavis/vintage-pc-speech) USB stick, TDSR can drive the
+sound card itself:
+
+```ini
+[speech]
+backend = alsa          ; or TDSR_BACKEND=alsa in the environment
+alsa_device = default   ; any ALSA PCM name, e.g. plughw:1
+alsa_buffer = 50        ; ms queued in the device; a cancel drops at most this much
+engine = espeak         ; engine at start-up: espeak or dectalk
+dectalk_rate = 50       ; DECtalk's own rate (rate applies to espeak-ng)
+dectalk_voice = paul    ; paul betty harry frank dennis kit ursula rita wendy
+```
+
+`libasound` and `libespeak-ng` are loaded at run time. DECtalk is optional: build with
+`--features dectalk` and `DECTALK_LIB_DIR` pointing at a directory holding `libdectalk.a`
+(the accessible_os project builds one from the `dectalk/dectalk` sources). With both engines
+loaded, **Alt+s** switches between them and announces the new one; DECtalk voices appear as
+`dectalk:paul` etc. after the espeak-ng voices in the configuration menu.
 
 ### TUI Mode (menus and dialogs)
 
@@ -334,6 +356,7 @@ character review all work, and `Alt+o` or `Alt+O` come back down.
 - `Alt+r` - Start/end selection (then Alt+r again to copy)
 - `Alt+v` - Copy mode (then 'l' for line, 's' for screen)
 - `Alt+x` - Silence speech
+- **Alt+s** - Switch speech engine (ALSA backend: espeak-ng / DECtalk)
 
 ### TUI Mode
 - `Alt+t` - Cycle TUI mode: auto, apps, on, off

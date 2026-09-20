@@ -18,6 +18,11 @@ pub mod espeak;
 // PulseAudio backend using espeak-ng subprocesses for WSL/WSLG (fallback)
 pub mod pulseaudio;
 
+// In-process engines (espeak-ng, DECtalk) with direct ALSA playback: the
+// appliance backend, `[speech] backend = alsa`
+#[cfg(target_os = "linux")]
+pub mod alsa;
+
 // macOS AVFoundation backend, run as a `tdsr --speech-server` subprocess
 #[cfg(target_os = "macos")]
 pub mod avfoundation;

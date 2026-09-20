@@ -136,7 +136,7 @@ const ESPEAK_POS_CHARACTER: c_int = 1;
 const ESPEAK_RATE: c_int = 1;
 const ESPEAK_VOLUME: c_int = 2;
 
-type SynthCallback = unsafe extern "C" fn(*mut i16, c_int, *mut c_void) -> c_int;
+pub(crate) type SynthCallback = unsafe extern "C" fn(*mut i16, c_int, *mut c_void) -> c_int;
 type EspeakInitialize = unsafe extern "C" fn(c_int, c_int, *const c_char, c_int) -> c_int;
 type EspeakSetSynthCallback = unsafe extern "C" fn(Option<SynthCallback>);
 type EspeakSynthFn = unsafe extern "C" fn(
@@ -173,7 +173,7 @@ struct EspeakVoiceRaw {
 }
 
 /// The espeak-ng library. Not thread-safe: used only by the audio thread.
-struct Espeak {
+pub(crate) struct Espeak {
     _lib: Library,
     synth: EspeakSynthFn,
     set_parameter: EspeakSetParameter,
@@ -189,7 +189,7 @@ struct Espeak {
 }
 
 impl Espeak {
-    fn load(callback: SynthCallback) -> Result<Self> {
+    pub(crate) fn load(callback: SynthCallback) -> Result<Self> {
         let err = |e: libloading::Error| TdsrError::Speech(format!("libespeak-ng: {}", e));
         // SAFETY: loading a well-known shared library and looking up its
         // documented entry points; the signatures match espeak_lib.h.
@@ -250,7 +250,7 @@ impl Espeak {
     /// Select a voice by name or identifier (`gmw/en-US`, `mb/mb-us1`).
     /// Returns false if espeak-ng could not load it; the library's current
     /// voice is then undefined, so the caller should select another.
-    fn set_voice(&mut self, name: &str) -> bool {
+    pub(crate) fn set_voice(&mut self, name: &str) -> bool {
         let Ok(c) = CString::new(name) else {
             return false;
         };
@@ -287,7 +287,7 @@ impl Espeak {
     }
 
     /// Every voice espeak-ng knows: its own, then the MBROLA definitions.
-    fn voices(&self) -> VoiceCatalogue {
+    pub(crate) fn voices(&self) -> VoiceCatalogue {
         // SAFETY: library initialised; the list is read and copied before
         // the next call, which frees it.
         let native = unsafe { self.read_voice_list(ptr::null()) };
@@ -346,19 +346,19 @@ impl Espeak {
         out
     }
 
-    fn set_rate(&self, wpm: u16) {
+    pub(crate) fn set_rate(&self, wpm: u16) {
         // SAFETY: library initialised.
         unsafe { (self.set_parameter)(ESPEAK_RATE, wpm as c_int, 0) };
     }
 
-    fn set_volume(&self, amplitude: u8) {
+    pub(crate) fn set_volume(&self, amplitude: u8) {
         // SAFETY: library initialised.
         unsafe { (self.set_parameter)(ESPEAK_VOLUME, amplitude as c_int, 0) };
     }
 
     /// Synthesise `text`, delivering PCM to the callback until it is done or
     /// the callback asks to stop.
-    fn synth(&self, text: &str, end_pause: bool) {
+    pub(crate) fn synth(&self, text: &str, end_pause: bool) {
         let Ok(c) = CString::new(text) else { return };
         let flags = ESPEAK_CHARS_UTF8 | if end_pause { ESPEAK_ENDPAUSE } else { 0 };
         // SAFETY: `c` outlives the (synchronous) call; size includes the NUL.
@@ -374,6 +374,64 @@ impl Espeak {
                 ptr::null_mut(),
             );
         }
+    }
+    /// Rate of the PCM the current voice produces.
+    pub(crate) fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Synthesise `text` with the chunks delivered to `sink` (for a library
+    /// loaded with [`chunk_callback`]); `sink` returns false to stop.
+    pub(crate) fn synth_to(
+        &self,
+        text: &str,
+        end_pause: bool,
+        sink: &mut dyn FnMut(&[i16]) -> bool,
+    ) {
+        let ptr: *mut (dyn FnMut(&[i16]) -> bool + '_) = sink;
+        // SAFETY: the pointer is only dereferenced by `chunk_callback` during
+        // the synchronous `synth` call below, while `sink` is alive; the
+        // transmute only erases the lifetime.
+        let ptr: ChunkSink = unsafe { std::mem::transmute(ptr) };
+        CHUNK_SINK.with(|s| s.set(Some(ptr)));
+        self.synth(text, end_pause);
+        CHUNK_SINK.with(|s| s.set(None));
+    }
+}
+
+/// A PCM consumer installed for the duration of one synchronous synth call.
+pub(crate) type ChunkSink = *mut (dyn FnMut(&[i16]) -> bool + 'static);
+
+thread_local! {
+    /// Where [`chunk_callback`] delivers, set around each `synth_to` call.
+    static CHUNK_SINK: Cell<Option<ChunkSink>> = const { Cell::new(None) };
+}
+
+/// A synth callback for backends that consume the PCM themselves (the ALSA
+/// backend): every chunk goes to the sink installed by [`Espeak::synth_to`].
+pub(crate) unsafe extern "C" fn chunk_callback(
+    wav: *mut i16,
+    count: c_int,
+    _events: *mut c_void,
+) -> c_int {
+    let Some(sink) = CHUNK_SINK.with(|s| s.get()) else {
+        return 1;
+    };
+    if wav.is_null() {
+        return 0;
+    }
+    let samples = if count > 0 {
+        // SAFETY: espeak hands us `count` valid samples.
+        unsafe { std::slice::from_raw_parts(wav, count as usize) }
+    } else {
+        &[]
+    };
+    // SAFETY: installed by the thread making the synchronous call, for its
+    // duration.
+    if unsafe { &mut *sink }(samples) {
+        0
+    } else {
+        1
     }
 }
 

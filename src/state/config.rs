@@ -332,6 +332,35 @@ impl Config {
         (!v.is_empty()).then(|| v.to_string())
     }
 
+    /// Speech backend (`[speech] backend`): `alsa` for the in-process
+    /// engines with direct ALSA playback, otherwise the platform chain.
+    pub fn backend(&self) -> Option<String> {
+        let b = self.get_string("speech", "backend", "");
+        if b.trim().is_empty() {
+            None
+        } else {
+            Some(b.trim().to_string())
+        }
+    }
+
+    /// Options of the ALSA backend (`[speech]`: alsa_device, engine,
+    /// dectalk_rate, dectalk_voice, alsa_buffer).
+    #[cfg(target_os = "linux")]
+    pub fn alsa_options(&self) -> crate::speech::backends::alsa::AlsaOptions {
+        let d = crate::speech::backends::alsa::AlsaOptions::default();
+        crate::speech::backends::alsa::AlsaOptions {
+            device: self.get_string("speech", "alsa_device", &d.device),
+            engine: self.get_string("speech", "engine", &d.engine),
+            dectalk_rate: self
+                .get_int("speech", "dectalk_rate", d.dectalk_rate as i32)
+                .clamp(0, 100) as u8,
+            dectalk_voice: self.get_string("speech", "dectalk_voice", &d.dectalk_voice),
+            buffer_ms: self
+                .get_int("speech", "alsa_buffer", d.buffer_ms as i32)
+                .clamp(10, 1000) as u32,
+        }
+    }
+
     /// External speech server command (`[speech] speech_command`), if set.
     ///
     /// The command is started once and driven over its stdin with the

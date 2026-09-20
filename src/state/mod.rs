@@ -149,7 +149,7 @@ impl State {
 
         // Create speech synthesizer
         let speech_command = speech_command.or_else(|| config.speech_command());
-        let synth = crate::speech::create_synth(speech_command.as_deref())?;
+        let synth = crate::speech::synth::create_synth_for(&config, speech_command.as_deref())?;
         info!("Speech synthesizer created");
 
         Self::from_parts(config, synth, cols, rows)
@@ -651,6 +651,12 @@ impl State {
     /// Cancel any pending speech
     pub fn cancel_speech(&mut self) -> Result<()> {
         self.synth_op("cancel", |s| s.cancel())
+    }
+
+    /// Switch to the other speech engine (alt+s); the name to announce, or
+    /// the error to announce.
+    pub fn next_engine(&mut self) -> Result<String> {
+        self.synth.next_engine()
     }
 
     // ========== Review Cursor Navigation ==========

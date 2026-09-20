@@ -21,6 +21,10 @@ path = "src/main.rs"
 # such builds use the espeak-ng backends on Linux.
 default = ["native-speech"]
 native-speech = ["dep:speech-dispatcher"]
+# `dectalk` links the DECtalk engine statically into the ALSA backend. Build
+# with DECTALK_LIB_DIR pointing at the directory holding libdectalk.a (see
+# the accessible_os alpine/src/dectalk Makefile).
+dectalk = []
 
 [dependencies]
 # Terminal emulation

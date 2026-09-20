@@ -170,6 +170,15 @@ impl DefaultKeyHandler {
                 Ok(HandlerAction::Handled)
             }
 
+            // Switch speech engine (espeak-ng / DECtalk on the ALSA backend)
+            SwitchEngine => {
+                match state.next_engine() {
+                    Ok(name) => state.speak(&name)?,
+                    Err(e) => state.speak(&e.to_string())?,
+                }
+                Ok(HandlerAction::Handled)
+            }
+
             // Silence - cancel any pending speech
             Silence => {
                 debug!("Silence requested");

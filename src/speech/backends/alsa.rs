@@ -389,7 +389,11 @@ mod dectalk {
             };
             let prefix = format!("[:{}][:ra {}]", self.voice_cmd, dectalk_wpm(self.rate));
             let clean = dectalk_text(text);
-            let pieces = if is_letter {
+            // Key echo: a typed character is spelled (`[:say letter]`); a
+            // symbol name for it ("space", "dollar") is a word and is spoken
+            // as one.
+            let single = clean.trim().chars().count() == 1;
+            let pieces = if is_letter && single {
                 vec![format!("[:say letter]{}[:say clause]", clean.trim())]
             } else {
                 dectalk_pieces(&clean)

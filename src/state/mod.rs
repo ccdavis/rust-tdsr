@@ -166,7 +166,7 @@ impl State {
         rows: u16,
     ) -> Result<Self> {
         // Apply config settings to synth (the rate of the engine it starts
-        // with; the ALSA backend sets both of its engines' rates itself)
+        // with; the ALSA backend sets each of its engines' rates itself)
         if let Some(rate) = config.rate_at(synth.rate_key()) {
             synth.set_rate(rate)?;
             info!("Speech rate set to {}", rate);

@@ -170,13 +170,21 @@ sound card itself:
 backend = alsa          ; or TDSR_BACKEND=alsa in the environment
 alsa_device = default   ; any ALSA PCM name, e.g. plughw:1
 alsa_buffer = 50        ; ms queued in the device; a cancel drops at most this much
-engine = espeak         ; engine at start-up: espeak, dectalk or piper
+engine = espeak         ; engine at start-up: espeak, mbrola, dectalk, piper, rhvoice or pico
 dectalk_rate = 50       ; DECtalk's own rate (rate applies to espeak-ng); alt+c r
                         ; sets and saves the rate of the engine speaking
 dectalk_voice = paul    ; paul betty harry frank dennis kit ursula rita wendy
 piper_rate = 50         ; Piper's own rate (0-100, 50 is the voice's natural speed)
 piper_voice = en_US-joe-medium   ; voice at start-up (default: the first found)
 piper_voices = /usr/share/piper-voices   ; `:`-separated directories of Piper voices
+mbrola_rate = 50        ; MBROLA's own rate (80 wpm at 0, 190 at 50, 300 at 100)
+mbrola_voice = us1      ; an installed MBROLA database: us1 us2 us3 en1 ...
+rhvoice_rate = 50       ; RHVoice's own rate (50 is the voice's normal speed)
+rhvoice_voice = slt     ; alan bdl clb slt ... (the voices in rhvoice_data)
+rhvoice_data = /usr/share/RHVoice   ; `:`-separated; the first with a voices/ directory
+pico_rate = 50          ; Pico's own rate (its <speed> markup, 33% to 300%)
+pico_voice = en-US      ; en-US en-GB de-DE es-ES fr-FR it-IT
+pico_lang = /usr/share/pico/lang
 ```
 
 `libasound` and `libespeak-ng` are loaded at run time. DECtalk is optional: build with
@@ -184,6 +192,17 @@ piper_voices = /usr/share/piper-voices   ; `:`-separated directories of Piper vo
 (the accessible_os project builds one from the `dectalk/dectalk` sources). With both engines
 loaded, **Alt+s** steps through them and announces the new one; DECtalk voices appear as
 `dectalk:paul` etc. after the espeak-ng voices in the configuration menu.
+
+espeak-ng's installed MBROLA voices are also an engine of their own (`mbrola`, voices
+`mbrola:us1`), with its own rate: diphone voices need a much slower rate than espeak-ng's own.
+Both engines share one espeak-ng, and each sets its voice, rate and volume before speaking.
+
+RHVoice (`libRHVoice.so.1`, a statistical voice made for screen readers) and SVOX Pico
+(`libttspico.so.0`, from the `picotts` package) are loaded at run time when present, like
+espeak-ng; their voices appear as `rhvoice:slt` and `pico:en-GB`. A cancel stops either at
+once (RHVoice through its speech callback, Pico between its output steps). If the device
+refuses an engine's sample rate (alsa-lib's `snd_pcm_set_params` refuses 24000 Hz, RHVoice's,
+on a 48000 Hz dmix), TDSR opens it at twice the rate and upsamples.
 
 Piper neural voices are optional too: build with `--features piper`. They run in-process with
 [rten](https://github.com/robertknight/rten) (pure Rust ONNX inference, so no ONNX Runtime

@@ -170,7 +170,7 @@ impl DefaultKeyHandler {
                 Ok(HandlerAction::Handled)
             }
 
-            // Switch speech engine (espeak-ng / DECtalk on the ALSA backend)
+            // Switch to the next speech engine (the ALSA backend has several)
             SwitchEngine => {
                 match state.next_engine() {
                     Ok(name) => state.speak(&name)?,

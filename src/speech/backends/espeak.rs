@@ -305,6 +305,11 @@ impl Espeak {
         ok
     }
 
+    /// The voice selected for speaking, if one is.
+    pub(crate) fn selected_voice(&self) -> Option<String> {
+        self.voice.clone()
+    }
+
     /// Put `name` into the library without changing the voice selected for
     /// speaking.
     fn load_voice(&mut self, name: &str) -> bool {
@@ -472,6 +477,11 @@ impl Espeak {
     /// the callback asks to stop.
     pub(crate) fn synth(&mut self, text: &str, end_pause: bool) {
         self.restore_voice();
+        self.synth_loaded(text, end_pause);
+    }
+
+    /// Synthesise with whatever voice is in the library.
+    fn synth_loaded(&self, text: &str, end_pause: bool) {
         let Ok(c) = CString::new(text) else { return };
         let flags = ESPEAK_CHARS_UTF8 | if end_pause { ESPEAK_ENDPAUSE } else { 0 };
         // SAFETY: `c` outlives the (synchronous) call; size includes the NUL.
@@ -494,34 +504,72 @@ impl Espeak {
     }
 
     /// Synthesise `text` with the chunks delivered to `sink` (for a library
-    /// loaded with [`chunk_callback`]); `sink` returns false to stop.
-    pub(crate) fn synth_to(
+    /// loaded with [`chunk_callback`]; `sink` returns false to stop), with
+    /// `voice` (None for the voice selected for speaking, which stays
+    /// selected either way) at `wpm` and `amplitude`. The ALSA backend's
+    /// espeak-ng and MBROLA engines share the library with different voices
+    /// and rates, so each call sets them.
+    pub(crate) fn synth_to_as(
         &mut self,
+        voice: Option<&str>,
+        wpm: u16,
+        amplitude: u8,
         text: &str,
         end_pause: bool,
         sink: &mut dyn FnMut(&[i16]) -> bool,
     ) {
-        let ptr: *mut (dyn FnMut(&[i16]) -> bool + '_) = sink;
-        // SAFETY: the pointer is only dereferenced by `chunk_callback` during
-        // the synchronous `synth` call below, while `sink` is alive; the
-        // transmute only erases the lifetime.
-        let ptr: ChunkSink = unsafe { std::mem::transmute(ptr) };
-        CHUNK_SINK.with(|s| s.set(Some(ptr)));
-        self.synth(text, end_pause);
-        CHUNK_SINK.with(|s| s.set(None));
+        match voice {
+            Some(v) => {
+                if !self.load_voice(v) {
+                    warn!("espeak-ng voice '{}' not available", v);
+                    return;
+                }
+            }
+            None => self.restore_voice(),
+        }
+        self.set_rate(wpm);
+        self.set_volume(amplitude);
+        with_sink(sink, || self.synth_loaded(text, end_pause));
     }
+
+    /// The PCM rate `voice` produces (loading it, without selecting it);
+    /// None if it does not load. Without `espeak_ng_GetSampleRate` the rate
+    /// is assumed to be MBROLA's usual 16000 Hz.
+    pub(crate) fn voice_sample_rate(&mut self, voice: &str) -> Option<u32> {
+        if !self.load_voice(voice) {
+            return None;
+        }
+        // SAFETY: library initialised.
+        let rate = self
+            .get_sample_rate
+            .map(|get| unsafe { get() })
+            .unwrap_or(16000);
+        Some(if rate > 0 { rate as u32 } else { 16000 })
+    }
+}
+
+/// Run `f` with `sink` installed for [`chunk_callback`].
+fn with_sink(sink: &mut dyn FnMut(&[i16]) -> bool, f: impl FnOnce()) {
+    let ptr: *mut (dyn FnMut(&[i16]) -> bool + '_) = sink;
+    // SAFETY: the pointer is only dereferenced by `chunk_callback` during the
+    // synchronous synthesis in `f`, while `sink` is alive; the transmute only
+    // erases the lifetime.
+    let ptr: ChunkSink = unsafe { std::mem::transmute(ptr) };
+    CHUNK_SINK.with(|s| s.set(Some(ptr)));
+    f();
+    CHUNK_SINK.with(|s| s.set(None));
 }
 
 /// A PCM consumer installed for the duration of one synchronous synth call.
 pub(crate) type ChunkSink = *mut (dyn FnMut(&[i16]) -> bool + 'static);
 
 thread_local! {
-    /// Where [`chunk_callback`] delivers, set around each `synth_to` call.
+    /// Where [`chunk_callback`] delivers, set around each `synth_to_as` call.
     static CHUNK_SINK: Cell<Option<ChunkSink>> = const { Cell::new(None) };
 }
 
 /// A synth callback for backends that consume the PCM themselves (the ALSA
-/// backend): every chunk goes to the sink installed by [`Espeak::synth_to`].
+/// backend): every chunk goes to the sink installed by [`Espeak::synth_to_as`].
 pub(crate) unsafe extern "C" fn chunk_callback(
     wav: *mut i16,
     count: c_int,

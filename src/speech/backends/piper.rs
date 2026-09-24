@@ -22,6 +22,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 
+/// Longest sentence (in phoneme characters) given to the model in one run:
+/// a longer one is ended at a clause boundary, or at a space inside a very
+/// long clause. Text without full stops (a listing, code) would otherwise be
+/// one run that takes seconds and a lot of memory, and cannot be cancelled.
+pub const MAX_SENTENCE: usize = 400;
+
 /// Peak level of the normalised output, below full scale so that Piper is
 /// about as loud as espeak-ng and DECtalk.
 const PEAK: f32 = 0.8;
@@ -160,6 +166,7 @@ impl VoiceConfig {
 /// A clause ending without a known mark (an espeak-ng without
 /// `espeak_TextToPhonemesWithTerminator` reports none) is followed by a
 /// space, so that its last word does not run into the next clause.
+/// Sentences are kept to [`MAX_SENTENCE`] phonemes.
 pub(crate) fn sentences(clauses: &[PhonemeClause]) -> Vec<Vec<char>> {
     let mut out = Vec::new();
     let mut cur: Vec<char> = Vec::new();
@@ -177,7 +184,7 @@ pub(crate) fn sentences(clauses: &[PhonemeClause]) -> Vec<Vec<char>> {
             _ => {}
         }
         cur.extend(text.nfd());
-        if term & CLAUSE_TYPE_SENTENCE != 0 {
+        if term & CLAUSE_TYPE_SENTENCE != 0 || cur.len() >= MAX_SENTENCE {
             push_sentence(&mut out, std::mem::take(&mut cur));
         }
     }
@@ -185,8 +192,19 @@ pub(crate) fn sentences(clauses: &[PhonemeClause]) -> Vec<Vec<char>> {
     out
 }
 
-/// Keep a sentence that has something to say, without trailing spaces.
+/// Keep a sentence that has something to say, without trailing spaces,
+/// cut at spaces into pieces of at most [`MAX_SENTENCE`].
 fn push_sentence(out: &mut Vec<Vec<char>>, mut sentence: Vec<char>) {
+    while sentence.len() > MAX_SENTENCE {
+        let cut = sentence[..MAX_SENTENCE]
+            .iter()
+            .rposition(|c| c.is_whitespace())
+            .filter(|&i| i > 0)
+            .unwrap_or(MAX_SENTENCE);
+        let rest = sentence.split_off(cut);
+        push_sentence(out, sentence);
+        sentence = rest.into_iter().skip_while(|c| c.is_whitespace()).collect();
+    }
     while sentence.last().is_some_and(|c| c.is_whitespace()) {
         sentence.pop();
     }
@@ -275,7 +293,10 @@ impl PiperVoice {
                 NdTensor::from([c.noise_scale, c.length_scale * length_factor, c.noise_w]).into(),
             ),
         ];
-        if let Some(sid) = c.speaker {
+        // A multi-speaker model whose config lacks num_speakers still needs
+        // a speaker: the default one.
+        let speaker = c.speaker.or_else(|| m.find_node("sid").map(|_| 0));
+        if let Some(sid) = speaker {
             inputs.push((
                 m.node_id("sid").map_err(|e| err(&e))?,
                 NdTensor::from([sid as i32]).into(),
@@ -352,6 +373,19 @@ mod tests {
         let s = sentences(&[clause("\u{e1}", CLAUSE_PERIOD)]);
         assert_eq!(s, vec![vec!['a', '\u{301}', '.']]);
         assert!(sentences(&[clause(" ", CLAUSE_PERIOD)]).is_empty());
+        // No full stop in a long text: cut at clause boundaries...
+        let comma = clause(&"ab ".repeat(100), CLAUSE_COMMA);
+        let s = sentences(&[comma.clone(), comma.clone(), comma]);
+        assert!(s.len() >= 2 && s.iter().all(|v| v.len() <= MAX_SENTENCE));
+        // ...and inside one very long clause, at spaces
+        let s = sentences(&[clause(&"abab ".repeat(300), 0)]);
+        assert!(s.len() >= 3 && s.iter().all(|v| v.len() <= MAX_SENTENCE));
+        assert!(s.iter().all(|v| !v[0].is_whitespace()));
+        let total: usize = s
+            .iter()
+            .map(|v| v.iter().filter(|c| **c == 'a').count())
+            .sum();
+        assert_eq!(total, 600);
     }
 
     #[test]

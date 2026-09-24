@@ -307,7 +307,8 @@ impl Config {
         self.rate_at("rate")
     }
 
-    /// A rate (0-100) stored under `[speech] key` (`rate`, `dectalk_rate`)
+    /// A rate (0-100) stored under `[speech] key` (`rate`, or an engine's
+    /// own such as `dectalk_rate`)
     pub fn rate_at(&self, key: &str) -> Option<u8> {
         self.get_int("speech", key, -1)
             .try_into()
@@ -350,7 +351,8 @@ impl Config {
 
     /// Options of the ALSA backend (`[speech]`: alsa_device, engine, rate,
     /// dectalk_rate, dectalk_voice, alsa_buffer, piper_rate, piper_voice,
-    /// piper_voices).
+    /// piper_voices, mbrola_rate, mbrola_voice, rhvoice_rate, rhvoice_voice,
+    /// rhvoice_data, pico_rate, pico_voice, pico_lang).
     #[cfg(target_os = "linux")]
     pub fn alsa_options(&self) -> crate::speech::backends::alsa::AlsaOptions {
         let d = crate::speech::backends::alsa::AlsaOptions::default();
@@ -370,6 +372,20 @@ impl Config {
                 .clamp(0, 100) as u8,
             piper_voice: self.get_string("speech", "piper_voice", &d.piper_voice),
             piper_voices: self.get_string("speech", "piper_voices", &d.piper_voices),
+            mbrola_rate: self
+                .get_int("speech", "mbrola_rate", d.mbrola_rate as i32)
+                .clamp(0, 100) as u8,
+            mbrola_voice: self.get_string("speech", "mbrola_voice", &d.mbrola_voice),
+            rhvoice_rate: self
+                .get_int("speech", "rhvoice_rate", d.rhvoice_rate as i32)
+                .clamp(0, 100) as u8,
+            rhvoice_voice: self.get_string("speech", "rhvoice_voice", &d.rhvoice_voice),
+            rhvoice_data: self.get_string("speech", "rhvoice_data", &d.rhvoice_data),
+            pico_rate: self
+                .get_int("speech", "pico_rate", d.pico_rate as i32)
+                .clamp(0, 100) as u8,
+            pico_voice: self.get_string("speech", "pico_voice", &d.pico_voice),
+            pico_lang: self.get_string("speech", "pico_lang", &d.pico_lang),
         }
     }
 

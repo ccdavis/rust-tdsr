@@ -104,3 +104,35 @@ fn test_tui_settings_defaults_and_parsing() {
     let config = Config::load_from(path).unwrap();
     assert_eq!(config.tui_mode(), TuiMode::Auto, "unknown values mean auto");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn alsa_options_read_every_engine_and_clamp_rates() {
+    let (_dir, path) = temp_config();
+    let config = Config::load_from(path.clone()).unwrap();
+    let d = config.alsa_options();
+    assert_eq!(d.engine, "espeak");
+    assert_eq!(d.espeak_rate, None);
+    assert_eq!(
+        (d.mbrola_rate, d.rhvoice_rate, d.pico_rate, d.piper_rate),
+        (50, 50, 50, 50)
+    );
+    assert_eq!(d.rhvoice_data, "/usr/share/RHVoice");
+    assert_eq!(d.pico_lang, "/usr/share/pico/lang");
+
+    std::fs::write(
+        &path,
+        "[speech]\nengine = rhvoice\nrate = 60\nmbrola_rate = 150\nmbrola_voice = us2\n\
+         rhvoice_voice = clb\nrhvoice_data = /media/usb/rhvoice:/usr/share/RHVoice\n\
+         pico_rate = 20\npico_voice = en-GB\n",
+    )
+    .unwrap();
+    let o = Config::load_from(path).unwrap().alsa_options();
+    assert_eq!(o.engine, "rhvoice");
+    assert_eq!(o.espeak_rate, Some(60));
+    assert_eq!(o.mbrola_rate, 100, "clamped");
+    assert_eq!(o.mbrola_voice, "us2");
+    assert_eq!(o.rhvoice_voice, "clb");
+    assert_eq!(o.rhvoice_data, "/media/usb/rhvoice:/usr/share/RHVoice");
+    assert_eq!((o.pico_rate, o.pico_voice.as_str()), (20, "en-GB"));
+}

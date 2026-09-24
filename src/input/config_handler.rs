@@ -282,8 +282,13 @@ impl ConfigHandler {
         match (state.synth.voice_count(), state.synth.voice_id(idx)) {
             (Some(_), Some(id)) => match state.synth.set_voice(&id) {
                 Ok(name) => {
-                    state.config.set("speech", "voice", &id);
-                    state.config.remove("speech", "voice_idx");
+                    // Each engine's voice under its own key, so that
+                    // choosing one engine's voice keeps the others'.
+                    let key = state.synth.voice_key(&id);
+                    state.config.set("speech", key, &id);
+                    if key == "voice" {
+                        state.config.remove("speech", "voice_idx");
+                    }
                     state.save_config()?;
                     state.speak(&format!("confirmed, {}", name))?;
                 }

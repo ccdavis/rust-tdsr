@@ -23,6 +23,12 @@ pub mod pulseaudio;
 #[cfg(target_os = "linux")]
 pub mod alsa;
 
+// RHVoice and SVOX Pico for the ALSA backend (libraries loaded at run time)
+#[cfg(target_os = "linux")]
+pub mod pico;
+#[cfg(target_os = "linux")]
+pub mod rhvoice;
+
 // Piper neural voices for the ALSA backend (feature `piper`)
 #[cfg(all(target_os = "linux", feature = "piper"))]
 pub mod piper;

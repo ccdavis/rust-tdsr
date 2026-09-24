@@ -89,13 +89,21 @@ pub trait Synth: Send {
     fn cancel(&mut self) -> Result<()>;
 
     /// The `[speech]` config key holding the rate of the engine now
-    /// speaking: `rate`, or the ALSA backend's `dectalk_rate` while DECtalk
-    /// is the current engine.
+    /// speaking: `rate`, or with the ALSA backend the current engine's own
+    /// (`mbrola_rate`, `dectalk_rate`, `piper_rate`, `rhvoice_rate`,
+    /// `pico_rate`).
     fn rate_key(&self) -> &'static str {
         "rate"
     }
 
-    /// Switch to the backend's other speech engine (alt+s) and return its
+    /// The `[speech]` config key a voice id is saved under: `voice`, or with
+    /// the ALSA backend the key of the engine the voice belongs to
+    /// (`piper_voice` for `piper:en_US-joe-medium`, and so on).
+    fn voice_key(&self, _id: &str) -> &'static str {
+        "voice"
+    }
+
+    /// Switch to the backend's next speech engine (alt+s) and return its
     /// spoken name. Only the ALSA backend has more than one.
     fn next_engine(&mut self) -> Result<String> {
         Err(crate::TdsrError::Speech(

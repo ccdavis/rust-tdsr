@@ -13,8 +13,9 @@ use tdsr::Result;
 /// The voices the recording synth pretends to have: (persistent id, name).
 const MOCK_VOICES: &[(&str, &str)] = &[("gmw/af", "Afrikaans"), ("gmw/en-US", "English (America)")];
 
-/// Synth that records every command instead of speaking.
-struct RecordingSynth(Arc<Mutex<Vec<SpeechCommand>>>);
+/// Synth that records every command instead of speaking; the second field
+/// is the config key of its current engine's rate.
+struct RecordingSynth(Arc<Mutex<Vec<SpeechCommand>>>, &'static str);
 
 impl Synth for RecordingSynth {
     fn send(&mut self, cmd: SpeechCommand) -> Result<()> {
@@ -62,6 +63,9 @@ impl Synth for RecordingSynth {
     fn cancel(&mut self) -> Result<()> {
         self.send(SpeechCommand::Cancel)
     }
+    fn rate_key(&self) -> &'static str {
+        self.1
+    }
 }
 
 struct Harness {
@@ -79,6 +83,12 @@ impl Harness {
 
     /// A harness whose config file starts with `contents`.
     fn with_config(contents: &str) -> Self {
+        Self::with_synth(contents, "rate")
+    }
+
+    /// Like `with_config`, with a synth whose current engine's rate lives
+    /// under `rate_key` (the ALSA backend's DECtalk: `dectalk_rate`).
+    fn with_synth(contents: &str, rate_key: &'static str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tdsr.cfg");
         if !contents.is_empty() {
@@ -86,7 +96,7 @@ impl Harness {
         }
         let config = Config::load_from(path).unwrap();
         let spoken = Arc::new(Mutex::new(Vec::new()));
-        let synth = Box::new(RecordingSynth(spoken.clone()));
+        let synth = Box::new(RecordingSynth(spoken.clone(), rate_key));
         let state = State::from_parts(config, synth, 20, 5).unwrap();
         Self {
             state,
@@ -165,6 +175,28 @@ fn config_menu_numeric_entry_sets_rate() {
     assert!(h.feed(b"\r").is_empty());
     assert_eq!(h.state.handlers.len(), 0);
     assert_eq!(h.feed(b"a"), vec![b"a".to_vec()]);
+}
+
+#[test]
+fn each_engine_keeps_its_own_rate() {
+    // DECtalk speaking: its rate comes from dectalk_rate at start-up, not
+    // from espeak-ng's rate, and the config menu saves it there.
+    let mut h = Harness::with_synth("[speech]\nrate = 60\ndectalk_rate = 30\n", "dectalk_rate");
+    assert!(
+        matches!(h.commands().first(), Some(SpeechCommand::SetRate(30))),
+        "start-up rate should be dectalk_rate, got {:?}",
+        h.commands()
+    );
+    h.clear_spoken();
+    h.feed(b"\x1bc");
+    h.feed(b"r");
+    h.feed(b"70\r");
+    assert!(h
+        .commands()
+        .iter()
+        .any(|c| matches!(c, SpeechCommand::SetRate(70))));
+    assert_eq!(h.state.config.rate_at("dectalk_rate"), Some(70));
+    assert_eq!(h.state.config.rate(), Some(60), "espeak-ng's rate untouched");
 }
 
 #[test]

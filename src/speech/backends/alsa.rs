@@ -58,7 +58,9 @@ pub struct AlsaOptions {
     pub device: String,
     /// Engine to start with (`engine`): `espeak` or `dectalk`.
     pub engine: String,
-    /// DECtalk's own rate, 0-100 (`dectalk_rate`); `rate` is espeak-ng's.
+    /// espeak-ng's rate, 0-100 (`rate`), if configured.
+    pub espeak_rate: Option<u8>,
+    /// DECtalk's own rate, 0-100 (`dectalk_rate`).
     pub dectalk_rate: u8,
     /// DECtalk voice (`dectalk_voice`): paul, betty, harry, frank, dennis,
     /// kit, ursula, rita or wendy.
@@ -73,6 +75,7 @@ impl Default for AlsaOptions {
         Self {
             device: "default".to_string(),
             engine: "espeak".to_string(),
+            espeak_rate: None,
             dectalk_rate: 50,
             dectalk_voice: "paul".to_string(),
             buffer_ms: 50,
@@ -662,6 +665,7 @@ impl Shared {
 struct Ready {
     espeak_voices: Option<VoiceCatalogue>,
     engines: Vec<EngineKind>,
+    current: EngineKind,
 }
 
 enum Job {
@@ -866,7 +870,12 @@ fn audio_thread(shared: Arc<Shared>, opts: AlsaOptions, ready: mpsc::Sender<Resu
         }
     };
     let espeak = match EspeakEngine::load() {
-        Ok(e) => Some(e),
+        Ok(mut e) => {
+            if let Some(rate) = opts.espeak_rate {
+                e.set_rate(rate);
+            }
+            Some(e)
+        }
         Err(e) => {
             info!("espeak-ng not loaded: {}", e);
             None
@@ -915,6 +924,7 @@ fn audio_thread(shared: Arc<Shared>, opts: AlsaOptions, ready: mpsc::Sender<Resu
     let _ = ready.send(Ok(Ready {
         espeak_voices,
         engines,
+        current: worker.current,
     }));
     worker.run();
 }
@@ -924,6 +934,10 @@ fn audio_thread(shared: Arc<Shared>, opts: AlsaOptions, ready: mpsc::Sender<Resu
 pub struct AlsaSynth {
     shared: Arc<Shared>,
     espeak_voices: Option<VoiceCatalogue>,
+    /// Loaded engines, in the audio thread's order
+    engines: Vec<EngineKind>,
+    /// The engine speaking now (kept in step with the audio thread's)
+    current: EngineKind,
     audio_thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -963,6 +977,8 @@ impl AlsaSynth {
         Ok(Self {
             shared,
             espeak_voices: ready.espeak_voices,
+            engines: ready.engines,
+            current: ready.current,
             audio_thread: Some(audio_thread),
         })
     }
@@ -1087,9 +1103,23 @@ impl Synth for AlsaSynth {
         Ok(())
     }
 
+    /// Each engine keeps its own rate: `rate` is espeak-ng's, `dectalk_rate`
+    /// DECtalk's, so a rate set in the config menu goes to the one speaking.
+    fn rate_key(&self) -> &'static str {
+        match self.current {
+            EngineKind::Espeak => "rate",
+            EngineKind::Dectalk => "dectalk_rate",
+        }
+    }
+
     fn next_engine(&mut self) -> Result<String> {
         self.cancel()?;
-        self.ask(|reply| Control::Engine(None, reply))
+        let name = self.ask(|reply| Control::Engine(None, reply))?;
+        // The audio thread switched to the first other loaded engine.
+        if let Some(&k) = self.engines.iter().find(|&&k| k != self.current) {
+            self.current = k;
+        }
+        Ok(name)
     }
 }
 

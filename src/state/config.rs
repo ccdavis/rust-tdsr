@@ -304,7 +304,12 @@ impl Config {
 
     /// Speech rate (0-100)
     pub fn rate(&self) -> Option<u8> {
-        self.get_int("speech", "rate", -1)
+        self.rate_at("rate")
+    }
+
+    /// A rate (0-100) stored under `[speech] key` (`rate`, `dectalk_rate`)
+    pub fn rate_at(&self, key: &str) -> Option<u8> {
+        self.get_int("speech", key, -1)
             .try_into()
             .ok()
             .filter(|&r| r <= 100)
@@ -343,7 +348,7 @@ impl Config {
         }
     }
 
-    /// Options of the ALSA backend (`[speech]`: alsa_device, engine,
+    /// Options of the ALSA backend (`[speech]`: alsa_device, engine, rate,
     /// dectalk_rate, dectalk_voice, alsa_buffer).
     #[cfg(target_os = "linux")]
     pub fn alsa_options(&self) -> crate::speech::backends::alsa::AlsaOptions {
@@ -351,6 +356,7 @@ impl Config {
         crate::speech::backends::alsa::AlsaOptions {
             device: self.get_string("speech", "alsa_device", &d.device),
             engine: self.get_string("speech", "engine", &d.engine),
+            espeak_rate: self.rate(),
             dectalk_rate: self
                 .get_int("speech", "dectalk_rate", d.dectalk_rate as i32)
                 .clamp(0, 100) as u8,

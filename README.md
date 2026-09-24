@@ -171,7 +171,8 @@ backend = alsa          ; or TDSR_BACKEND=alsa in the environment
 alsa_device = default   ; any ALSA PCM name, e.g. plughw:1
 alsa_buffer = 50        ; ms queued in the device; a cancel drops at most this much
 engine = espeak         ; engine at start-up: espeak or dectalk
-dectalk_rate = 50       ; DECtalk's own rate (rate applies to espeak-ng)
+dectalk_rate = 50       ; DECtalk's own rate (rate applies to espeak-ng); alt+c r
+                        ; sets and saves the rate of the engine speaking
 dectalk_voice = paul    ; paul betty harry frank dennis kit ursula rita wendy
 ```
 
@@ -366,7 +367,7 @@ character review all work, and `Alt+o` or `Alt+O` come back down.
 
 ## Configuration Menu (Alt+c)
 
-- `r` - Set speech rate
+- `r` - Set speech rate (with the ALSA backend, of the engine speaking: `rate` or `dectalk_rate`)
 - `v` - Set volume
 - `V` - Set voice index
 - `p` - Toggle process symbols

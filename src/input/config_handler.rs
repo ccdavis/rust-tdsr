@@ -227,12 +227,13 @@ impl ConfigHandler {
         }
     }
 
-    /// Set speech rate from user input
+    /// Set the rate of the engine now speaking from user input
     fn set_rate(input: String, state: &mut State) -> Result<()> {
         match input.parse::<u8>() {
             Ok(rate) if rate <= 100 => {
                 debug!("Setting rate to {}", rate);
-                state.config.set("speech", "rate", &rate.to_string());
+                let key = state.synth.rate_key();
+                state.config.set("speech", key, &rate.to_string());
                 state.save_config()?;
                 state.synth.set_rate(rate)?;
                 state.speak("confirmed")?;

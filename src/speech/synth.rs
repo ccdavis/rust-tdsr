@@ -88,6 +88,13 @@ pub trait Synth: Send {
     /// Cancel/silence current speech
     fn cancel(&mut self) -> Result<()>;
 
+    /// The `[speech]` config key holding the rate of the engine now
+    /// speaking: `rate`, or the ALSA backend's `dectalk_rate` while DECtalk
+    /// is the current engine.
+    fn rate_key(&self) -> &'static str {
+        "rate"
+    }
+
     /// Switch to the backend's other speech engine (alt+s) and return its
     /// spoken name. Only the ALSA backend has more than one.
     fn next_engine(&mut self) -> Result<String> {

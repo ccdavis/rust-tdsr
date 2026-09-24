@@ -196,7 +196,11 @@ fn each_engine_keeps_its_own_rate() {
         .iter()
         .any(|c| matches!(c, SpeechCommand::SetRate(70))));
     assert_eq!(h.state.config.rate_at("dectalk_rate"), Some(70));
-    assert_eq!(h.state.config.rate(), Some(60), "espeak-ng's rate untouched");
+    assert_eq!(
+        h.state.config.rate(),
+        Some(60),
+        "espeak-ng's rate untouched"
+    );
 }
 
 #[test]

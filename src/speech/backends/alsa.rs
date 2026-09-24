@@ -16,8 +16,9 @@
 //!   cadence for long reading. Its single-threaded build has no stop call and
 //!   must not be told to halt mid-utterance (that path hangs the next
 //!   utterance), so a cancel makes the callback discard the rest of the
-//!   current sentence. Text is fed one sentence at a time to keep that
-//!   discard short.
+//!   current call. An utterance goes to the engine whole (DECtalk's
+//!   intonation spans the sentence); only text longer than
+//!   `DECTALK_PIECE` is split, which keeps that discard short.
 //!
 //! Everything talks to the engines and the device from one audio thread; the
 //! `Synth` methods only push onto a queue.
@@ -195,31 +196,43 @@ pub fn dectalk_wpm(rate: u8) -> u16 {
 }
 
 /// Longest piece of text handed to DECtalk in one call. A cancel discards
-/// the rest of the current piece, so this bounds the wasted synthesis.
-const DECTALK_PIECE: usize = 160;
+/// the rest of the current piece (synthesised at thousands of times real
+/// time), so this bounds the wasted work; a screen line is far shorter.
+const DECTALK_PIECE: usize = 400;
 
-/// Split text for DECtalk: at sentence ends, and at any word boundary once a
-/// piece reaches [`DECTALK_PIECE`] characters.
+/// Split text for DECtalk. Each call ends with a forced sentence end, and
+/// DECtalk shapes the pitch of a whole sentence (rise on the first stressed
+/// word, fall on the last) and handles sentence and clause punctuation inside
+/// one call itself, so text is only split when it is longer than
+/// [`DECTALK_PIECE`]: after the last sentence end that fits, else after a
+/// clause mark, else at a space.
 pub fn dectalk_pieces(text: &str) -> Vec<String> {
     let mut pieces = Vec::new();
-    let mut cur = String::new();
-    let mut prev = ' ';
-    for ch in text.chars() {
-        cur.push(ch);
-        let end_of_sentence = ch.is_whitespace() && matches!(prev, '.' | '?' | '!' | ';' | ':');
-        let long = cur.len() >= DECTALK_PIECE && ch.is_whitespace();
-        if end_of_sentence || long {
-            let piece = cur.trim();
-            if !piece.is_empty() {
-                pieces.push(piece.to_string());
-            }
-            cur.clear();
+    let mut rest = text.trim();
+    while rest.len() > DECTALK_PIECE {
+        let mut cut = DECTALK_PIECE;
+        while !rest.is_char_boundary(cut) {
+            cut -= 1;
         }
-        prev = ch;
+        let head = &rest[..cut];
+        // Byte offset just past a punctuation mark followed by a space.
+        let after = |marks: &[char]| {
+            head.char_indices()
+                .zip(head.chars().skip(1))
+                .filter(|((_, c), next)| marks.contains(c) && next.is_whitespace())
+                .map(|((i, c), _)| i + c.len_utf8())
+                .last()
+        };
+        let split = after(&['.', '?', '!'])
+            .or_else(|| after(&[',', ';', ':']))
+            .or_else(|| head.rfind(char::is_whitespace))
+            .filter(|&i| i > 0)
+            .unwrap_or(cut);
+        pieces.push(rest[..split].trim().to_string());
+        rest = rest[split..].trim_start();
     }
-    let piece = cur.trim();
-    if !piece.is_empty() {
-        pieces.push(piece.to_string());
+    if !rest.is_empty() {
+        pieces.push(rest.to_string());
     }
     pieces
 }
@@ -1112,18 +1125,36 @@ mod tests {
     }
 
     #[test]
-    fn pieces_split_at_sentences() {
-        let p = dectalk_pieces("One two. Three four? Five");
-        assert_eq!(p, vec!["One two.", "Three four?", "Five"]);
+    fn pieces_keep_a_line_whole() {
+        // DECtalk handles the sentence and clause marks itself.
+        let line = "One two. Three four? Five; six: Mr. Smith has 3.5 files.txt";
+        assert_eq!(dectalk_pieces(line), vec![line]);
+        assert_eq!(dectalk_pieces("  padded  "), vec!["padded"]);
+        assert!(dectalk_pieces("   ").is_empty());
     }
 
     #[test]
-    fn pieces_split_long_text_at_words() {
-        let text = "word ".repeat(100);
+    fn pieces_split_long_text_at_sentence_ends() {
+        let sentence = "This sentence is about forty characters. ";
+        let text = sentence.repeat(20);
         let p = dectalk_pieces(&text);
         assert!(p.len() > 1);
-        assert!(p.iter().all(|s| s.len() <= DECTALK_PIECE + 8));
+        assert!(p.iter().all(|s| s.len() <= DECTALK_PIECE && s.ends_with('.')));
+        assert_eq!(p.join(" "), text.trim());
+    }
+
+    #[test]
+    fn pieces_split_long_sentence_at_clauses_then_words() {
+        let text = "one, two three four five ".repeat(30);
+        let p = dectalk_pieces(&text);
+        assert!(p.len() > 1);
+        assert!(p[..p.len() - 1].iter().all(|s| s.ends_with(',')));
+        let text = "word ".repeat(100);
+        let p = dectalk_pieces(&text);
+        assert!(p.len() > 1 && p.iter().all(|s| s.len() <= DECTALK_PIECE));
         assert_eq!(p.join(" ").split_whitespace().count(), 100);
+        let p = dectalk_pieces(&"\u{e9}".repeat(300));
+        assert_eq!(p.concat().chars().count(), 300);
     }
 
     #[test]

@@ -7,7 +7,8 @@
 //! queued in the device, and a cancel is `snd_pcm_drop` on that buffer. No
 //! process, pipe or socket sits between a keystroke and silence.
 //!
-//! Two engines can be loaded, and alt+s switches between them at run time:
+//! Up to three engines can be loaded, and alt+s steps through them at run
+//! time:
 //!
 //! - espeak-ng, through the [`Espeak`] wrapper of the espeak backend (fast,
 //!   good for code and typing);
@@ -18,21 +19,29 @@
 //!   utterance), so a cancel makes the callback discard the rest of the
 //!   current call. An utterance goes to the engine whole (DECtalk's
 //!   intonation spans the sentence); only text longer than
-//!   `DECTALK_PIECE` is split, which keeps that discard short.
+//!   `DECTALK_PIECE` is split, which keeps that discard short;
+//! - Piper, with the `piper` feature: neural voices (`.onnx` files in the
+//!   `piper_voices` directories) run with rten; espeak-ng phonemises for it.
+//!   Each sentence is synthesised whole on a helper thread while the one
+//!   before it plays; a cancel stops the sound at once and drops the rest.
 //!
 //! Everything talks to the engines and the device from one audio thread; the
 //! `Synth` methods only push onto a queue.
 
 use crate::speech::backends::espeak::{chunk_callback, Espeak};
+#[cfg(feature = "piper")]
+use crate::speech::backends::piper;
 use crate::speech::backends::pulseaudio::wpm_for_rate;
 use crate::speech::voices::VoiceCatalogue;
 use crate::speech::{SpeechCommand, Synth};
 use crate::{Result, TdsrError};
 use libloading::Library;
 use log::{debug, info, warn};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void, CStr, CString};
 use std::ptr;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
@@ -56,7 +65,7 @@ pub struct AlsaOptions {
     /// ALSA PCM name (`alsa_device`); `default` goes through the system's
     /// asound.conf, `plughw:0` straight to the first card.
     pub device: String,
-    /// Engine to start with (`engine`): `espeak` or `dectalk`.
+    /// Engine to start with (`engine`): `espeak`, `dectalk` or `piper`.
     pub engine: String,
     /// espeak-ng's rate, 0-100 (`rate`), if configured.
     pub espeak_rate: Option<u8>,
@@ -68,6 +77,14 @@ pub struct AlsaOptions {
     /// Audio queued in the device, in ms (`alsa_buffer`). Bounds how much a
     /// cancel cannot take back.
     pub buffer_ms: u32,
+    /// Piper's rate, 0-100 (`piper_rate`).
+    pub piper_rate: u8,
+    /// Piper voice to start with (`piper_voice`, e.g. `en_US-joe-medium`);
+    /// empty for the first one found.
+    pub piper_voice: String,
+    /// `:`-separated directories holding Piper voices (`piper_voices`);
+    /// empty for `~/.local/share/piper-voices:/usr/share/piper-voices`.
+    pub piper_voices: String,
 }
 
 impl Default for AlsaOptions {
@@ -79,6 +96,9 @@ impl Default for AlsaOptions {
             dectalk_rate: 50,
             dectalk_voice: "paul".to_string(),
             buffer_ms: 50,
+            piper_rate: 50,
+            piper_voice: String::new(),
+            piper_voices: String::new(),
         }
     }
 }
@@ -87,6 +107,7 @@ impl Default for AlsaOptions {
 pub enum EngineKind {
     Espeak,
     Dectalk,
+    Piper,
 }
 
 impl EngineKind {
@@ -94,6 +115,7 @@ impl EngineKind {
         match name.trim().to_ascii_lowercase().as_str() {
             "espeak" | "espeak-ng" => Some(Self::Espeak),
             "dectalk" => Some(Self::Dectalk),
+            "piper" => Some(Self::Piper),
             _ => None,
         }
     }
@@ -103,12 +125,32 @@ impl EngineKind {
         match self {
             Self::Espeak => "e speak",
             Self::Dectalk => "DEC talk",
+            Self::Piper => "Piper",
+        }
+    }
+
+    /// The `[speech]` config key of this engine's rate.
+    fn rate_key(self) -> &'static str {
+        match self {
+            Self::Espeak => "rate",
+            Self::Dectalk => "dectalk_rate",
+            Self::Piper => "piper_rate",
         }
     }
 }
 
+/// The engine after `current` in `engines`, wrapping around (alt+s).
+fn next_after(engines: &[EngineKind], current: EngineKind) -> Option<EngineKind> {
+    let i = engines.iter().position(|&k| k == current)?;
+    let next = engines[(i + 1) % engines.len()];
+    (next != current).then_some(next)
+}
+
 /// Prefix of the voice ids this backend reports for DECtalk voices.
 const DECTALK_VOICE_PREFIX: &str = "dectalk:";
+
+/// Prefix of the voice ids of Piper voices (`piper:en_US-joe-medium`).
+const PIPER_VOICE_PREFIX: &str = "piper:";
 
 /// One engine as the audio thread drives it.
 trait Engine {
@@ -119,14 +161,16 @@ trait Engine {
     /// Select a voice; returns its spoken name.
     fn set_voice(&mut self, id: &str) -> std::result::Result<String, String>;
     /// Synthesise `text`, handing PCM to `sink` until it is done or `sink`
-    /// returns false.
+    /// returns false (a cancel). `sink(&[])` writes nothing and only answers
+    /// whether the utterance is still wanted.
     fn synth(&mut self, text: &str, is_letter: bool, sink: &mut dyn FnMut(&[i16]) -> bool);
 }
 
 // ---- espeak-ng -------------------------------------------------------------
 
 struct EspeakEngine {
-    lib: Espeak,
+    /// Shared with the Piper engine, which phonemises with it
+    lib: Rc<RefCell<Espeak>>,
     voices: VoiceCatalogue,
 }
 
@@ -137,22 +181,25 @@ impl EspeakEngine {
         if !lib.set_voice("en") {
             warn!("espeak-ng: default voice 'en' not available");
         }
-        Ok(Self { lib, voices })
+        Ok(Self {
+            lib: Rc::new(RefCell::new(lib)),
+            voices,
+        })
     }
 }
 
 impl Engine for EspeakEngine {
     fn sample_rate(&self) -> u32 {
-        self.lib.sample_rate()
+        self.lib.borrow().sample_rate()
     }
 
     fn set_rate(&mut self, rate: u8) {
-        self.lib.set_rate(wpm_for_rate(rate));
+        self.lib.borrow().set_rate(wpm_for_rate(rate));
     }
 
     fn set_volume(&mut self, volume: u8) {
         // espeak-ng's default amplitude is 100; above it the output clips.
-        self.lib.set_volume(volume.min(100));
+        self.lib.borrow().set_volume(volume.min(100));
     }
 
     fn set_voice(&mut self, id: &str) -> std::result::Result<String, String> {
@@ -163,17 +210,216 @@ impl Engine for EspeakEngine {
             }
             None => (id.trim().to_string(), id.trim().to_string()),
         };
-        if self.lib.set_voice(&ident) {
+        let mut lib = self.lib.borrow_mut();
+        if lib.set_voice(&ident) {
             Ok(name)
         } else {
             // The library's current voice is undefined after a failure.
-            self.lib.set_voice("en");
+            lib.set_voice("en");
             Err(format!("no voice {}", id))
         }
     }
 
     fn synth(&mut self, text: &str, is_letter: bool, sink: &mut dyn FnMut(&[i16]) -> bool) {
-        self.lib.synth_to(text, !is_letter, sink);
+        self.lib.borrow_mut().synth_to(text, !is_letter, sink);
+    }
+}
+
+// ---- Piper -----------------------------------------------------------------
+
+/// Spoken name of a Piper voice file: `en_US-joe-medium` -> `joe, US English`.
+pub fn piper_spoken_name(file: &str) -> String {
+    let mut parts = file.split('-');
+    let (Some(lang), Some(speaker)) = (parts.next(), parts.next()) else {
+        return file.to_string();
+    };
+    let lang = match lang {
+        "en_US" => "US English".to_string(),
+        "en_GB" => "British English".to_string(),
+        other => other.replace('_', " "),
+    };
+    format!("{}, {}", speaker.replace('_', " "), lang)
+}
+
+/// Samples per write to the device while a Piper sentence plays, so that a
+/// cancel is noticed within a few milliseconds.
+#[cfg(feature = "piper")]
+const PIPER_CHUNK: usize = 512;
+
+/// How often the audio thread checks for a cancel while a sentence is
+/// being synthesised.
+#[cfg(feature = "piper")]
+const PIPER_POLL: Duration = Duration::from_millis(10);
+
+#[cfg(feature = "piper")]
+struct PiperEngine {
+    /// espeak-ng, for phonemes (shared with the espeak-ng engine)
+    espeak: Rc<RefCell<Espeak>>,
+    voices: Vec<piper::VoiceFile>,
+    current: usize,
+    /// The current voice's model, loaded on first use (about 100 MB of RAM);
+    /// shared with the synthesis thread, which may outlive a cancel
+    loaded: Option<Arc<piper::PiperVoice>>,
+    rate: u8,
+    volume: u8,
+}
+
+#[cfg(feature = "piper")]
+impl PiperEngine {
+    /// None when there is no voice or espeak-ng cannot phonemise.
+    fn new(espeak: Rc<RefCell<Espeak>>, opts: &AlsaOptions) -> Option<Self> {
+        if !espeak.borrow().can_phonemise() {
+            info!("Piper not loaded: espeak-ng has no phoneme output");
+            return None;
+        }
+        let dirs = if opts.piper_voices.trim().is_empty() {
+            piper::default_dirs()
+        } else {
+            opts.piper_voices.clone()
+        };
+        let voices = piper::find_voices(&dirs);
+        if voices.is_empty() {
+            info!("Piper not loaded: no voices in {}", dirs);
+            return None;
+        }
+        let mut engine = Self {
+            espeak,
+            voices,
+            current: 0,
+            loaded: None,
+            rate: opts.piper_rate,
+            volume: 100,
+        };
+        if !opts.piper_voice.trim().is_empty() {
+            if let Err(e) = engine.set_voice(&opts.piper_voice) {
+                warn!("{}", e);
+            }
+        }
+        Some(engine)
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.voices.iter().map(|v| v.name.clone()).collect()
+    }
+
+    fn voice(&mut self) -> Option<Arc<piper::PiperVoice>> {
+        if self.loaded.is_none() {
+            let file = &self.voices[self.current];
+            let start = Instant::now();
+            match piper::PiperVoice::load(file) {
+                Ok(v) => {
+                    info!("Piper voice {} loaded in {:?}", file.name, start.elapsed());
+                    self.loaded = Some(Arc::new(v));
+                }
+                Err(e) => warn!("{}", e),
+            }
+        }
+        self.loaded.clone()
+    }
+}
+
+#[cfg(feature = "piper")]
+impl Engine for PiperEngine {
+    fn sample_rate(&self) -> u32 {
+        self.voices[self.current].config.sample_rate
+    }
+
+    fn set_rate(&mut self, rate: u8) {
+        self.rate = rate;
+    }
+
+    fn set_volume(&mut self, volume: u8) {
+        self.volume = volume.min(100);
+    }
+
+    fn set_voice(&mut self, id: &str) -> std::result::Result<String, String> {
+        let name = id
+            .trim()
+            .strip_prefix(PIPER_VOICE_PREFIX)
+            .unwrap_or(id.trim());
+        let i = self
+            .voices
+            .iter()
+            .position(|v| v.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| format!("no Piper voice {}", name))?;
+        if i != self.current {
+            self.current = i;
+            self.loaded = None;
+        }
+        Ok(piper_spoken_name(&self.voices[i].name))
+    }
+
+    fn synth(&mut self, text: &str, _is_letter: bool, sink: &mut dyn FnMut(&[i16]) -> bool) {
+        let espeak_voice = self.voices[self.current].config.espeak_voice.clone();
+        let Some(clauses) = self.espeak.borrow_mut().phonemes_ipa(&espeak_voice, text) else {
+            warn!(
+                "Piper: espeak-ng could not phonemise with voice {}",
+                espeak_voice
+            );
+            return;
+        };
+        let sentences = piper::sentences(&clauses);
+        for s in &sentences {
+            debug!("Piper phonemes: {}", s.iter().collect::<String>());
+        }
+        if sentences.is_empty() {
+            return;
+        }
+        let factor = piper::length_factor(self.rate);
+        let volume = self.volume;
+        let Some(voice) = self.voice() else { return };
+        // Sentences are synthesised on a helper thread, the next one while
+        // this one plays. The model cannot be interrupted, so after a cancel
+        // the helper finishes the sentence it is on and throws it away while
+        // this thread is already free for the next utterance.
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel::<Vec<i16>>(1);
+        let helper_stop = Arc::clone(&stop);
+        let spawned = thread::Builder::new()
+            .name("tdsr-piper".to_string())
+            .spawn(move || {
+                for s in &sentences {
+                    if helper_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match voice.synthesize(s, factor) {
+                        Ok(samples) => {
+                            if tx.send(piper::to_pcm(&samples, volume)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("{}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            warn!("Piper: cannot start the synthesis thread: {}", e);
+            return;
+        }
+        loop {
+            match rx.recv_timeout(PIPER_POLL) {
+                Ok(pcm) => {
+                    for chunk in pcm.chunks(PIPER_CHUNK) {
+                        if !sink(chunk) {
+                            stop.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                }
+                // Still synthesising: an empty write asks whether the
+                // utterance is still wanted.
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !sink(&[]) {
+                        stop.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
     }
 }
 
@@ -664,6 +910,8 @@ impl Shared {
 /// What the constructor learns from the audio thread.
 struct Ready {
     espeak_voices: Option<VoiceCatalogue>,
+    /// Piper voice file names
+    piper_voices: Vec<String>,
     engines: Vec<EngineKind>,
     current: EngineKind,
 }
@@ -684,6 +932,8 @@ struct Worker {
     espeak: Option<EspeakEngine>,
     #[cfg(feature = "dectalk")]
     dectalk: Option<dectalk::DectalkEngine>,
+    #[cfg(feature = "piper")]
+    piper: Option<PiperEngine>,
     current: EngineKind,
     pcm: Option<Pcm>,
     /// Audio has been written since the last drain
@@ -699,6 +949,10 @@ impl Worker {
             EngineKind::Dectalk => self.dectalk.as_mut().map(|e| e as &mut dyn Engine),
             #[cfg(not(feature = "dectalk"))]
             EngineKind::Dectalk => None,
+            #[cfg(feature = "piper")]
+            EngineKind::Piper => self.piper.as_mut().map(|e| e as &mut dyn Engine),
+            #[cfg(not(feature = "piper"))]
+            EngineKind::Piper => None,
         }
     }
 
@@ -711,11 +965,15 @@ impl Worker {
         if self.dectalk.is_some() {
             v.push(EngineKind::Dectalk);
         }
+        #[cfg(feature = "piper")]
+        if self.piper.is_some() {
+            v.push(EngineKind::Piper);
+        }
         v
     }
 
     fn other_engine(&self) -> Option<EngineKind> {
-        self.engines().into_iter().find(|&k| k != self.current)
+        next_after(&self.engines(), self.current)
     }
 
     /// The stream for the current engine's rate, (re)opened as needed.
@@ -785,6 +1043,8 @@ impl Worker {
             Control::Voice(id, reply) => {
                 let kind = if id.starts_with(DECTALK_VOICE_PREFIX) {
                     EngineKind::Dectalk
+                } else if id.starts_with(PIPER_VOICE_PREFIX) {
+                    EngineKind::Piper
                 } else {
                     EngineKind::Espeak
                 };
@@ -892,6 +1152,14 @@ fn audio_thread(shared: Arc<Shared>, opts: AlsaOptions, ready: mpsc::Sender<Resu
             None
         }
     };
+    #[cfg(feature = "piper")]
+    let piper = espeak
+        .as_ref()
+        .and_then(|e| PiperEngine::new(Rc::clone(&e.lib), &opts));
+    #[cfg(feature = "piper")]
+    let piper_voices = piper.as_ref().map(|p| p.names()).unwrap_or_default();
+    #[cfg(not(feature = "piper"))]
+    let piper_voices = Vec::new();
     let mut worker = Worker {
         shared,
         alsa,
@@ -900,6 +1168,8 @@ fn audio_thread(shared: Arc<Shared>, opts: AlsaOptions, ready: mpsc::Sender<Resu
         espeak,
         #[cfg(feature = "dectalk")]
         dectalk,
+        #[cfg(feature = "piper")]
+        piper,
         current: EngineKind::Espeak,
         pcm: None,
         undrained: false,
@@ -923,6 +1193,7 @@ fn audio_thread(shared: Arc<Shared>, opts: AlsaOptions, ready: mpsc::Sender<Resu
     let espeak_voices = worker.espeak.as_ref().map(|e| e.voices.clone());
     let _ = ready.send(Ok(Ready {
         espeak_voices,
+        piper_voices,
         engines,
         current: worker.current,
     }));
@@ -934,6 +1205,7 @@ fn audio_thread(shared: Arc<Shared>, opts: AlsaOptions, ready: mpsc::Sender<Resu
 pub struct AlsaSynth {
     shared: Arc<Shared>,
     espeak_voices: Option<VoiceCatalogue>,
+    piper_voices: Vec<String>,
     /// Loaded engines, in the audio thread's order
     engines: Vec<EngineKind>,
     /// The engine speaking now (kept in step with the audio thread's)
@@ -970,13 +1242,15 @@ impl AlsaSynth {
             }
         };
         info!(
-            "ALSA backend ready, engines {:?}, {} espeak-ng voices",
+            "ALSA backend ready, engines {:?}, {} espeak-ng voices, Piper voices {:?}",
             ready.engines,
-            ready.espeak_voices.as_ref().map(|v| v.len()).unwrap_or(0)
+            ready.espeak_voices.as_ref().map(|v| v.len()).unwrap_or(0),
+            ready.piper_voices
         );
         Ok(Self {
             shared,
             espeak_voices: ready.espeak_voices,
+            piper_voices: ready.piper_voices,
             engines: ready.engines,
             current: ready.current,
             audio_thread: Some(audio_thread),
@@ -1053,29 +1327,35 @@ impl Synth for AlsaSynth {
         self.set_voice(&id).map(|_| ())
     }
 
-    /// An espeak-ng identifier or name (`gmw/en-US`, `en-us`), or a DECtalk
-    /// voice as `dectalk:paul`. Applies to that engine whether or not it is
-    /// the current one.
+    /// An espeak-ng identifier or name (`gmw/en-US`, `en-us`), a DECtalk
+    /// voice as `dectalk:paul`, or a Piper voice as `piper:en_US-joe-medium`.
+    /// Applies to that engine whether or not it is the current one.
     fn set_voice(&mut self, id: &str) -> Result<String> {
         let id = id.trim().to_string();
         self.ask(|reply| Control::Voice(id, reply))
     }
 
     fn voice_count(&self) -> Option<usize> {
-        Some(self.espeak_count() + DECTALK_VOICES.len())
+        Some(self.espeak_count() + DECTALK_VOICES.len() + self.piper_voices.len())
     }
 
+    /// espeak-ng's voices, then DECtalk's, then Piper's.
     fn voice_id(&self, idx: usize) -> Option<String> {
         let n = self.espeak_count();
+        let d = n + DECTALK_VOICES.len();
         if idx < n {
             self.espeak_voices
                 .as_ref()
                 .and_then(|v| v.get(idx))
                 .map(|v| v.identifier.clone())
-        } else {
+        } else if idx < d {
             DECTALK_VOICES
                 .get(idx - n)
                 .map(|(name, _, _)| format!("{}{}", DECTALK_VOICE_PREFIX, name))
+        } else {
+            self.piper_voices
+                .get(idx - d)
+                .map(|name| format!("{}{}", PIPER_VOICE_PREFIX, name))
         }
     }
 
@@ -1103,20 +1383,18 @@ impl Synth for AlsaSynth {
         Ok(())
     }
 
-    /// Each engine keeps its own rate: `rate` is espeak-ng's, `dectalk_rate`
-    /// DECtalk's, so a rate set in the config menu goes to the one speaking.
+    /// Each engine keeps its own rate (`rate` is espeak-ng's, `dectalk_rate`
+    /// DECtalk's, `piper_rate` Piper's), so a rate set in the config menu
+    /// goes to the one speaking.
     fn rate_key(&self) -> &'static str {
-        match self.current {
-            EngineKind::Espeak => "rate",
-            EngineKind::Dectalk => "dectalk_rate",
-        }
+        self.current.rate_key()
     }
 
     fn next_engine(&mut self) -> Result<String> {
         self.cancel()?;
         let name = self.ask(|reply| Control::Engine(None, reply))?;
-        // The audio thread switched to the first other loaded engine.
-        if let Some(&k) = self.engines.iter().find(|&&k| k != self.current) {
+        // The audio thread switched to the next loaded engine.
+        if let Some(k) = next_after(&self.engines, self.current) {
             self.current = k;
         }
         Ok(name)
@@ -1169,7 +1447,9 @@ mod tests {
         let text = sentence.repeat(20);
         let p = dectalk_pieces(&text);
         assert!(p.len() > 1);
-        assert!(p.iter().all(|s| s.len() <= DECTALK_PIECE && s.ends_with('.')));
+        assert!(p
+            .iter()
+            .all(|s| s.len() <= DECTALK_PIECE && s.ends_with('.')));
         assert_eq!(p.join(" "), text.trim());
     }
 

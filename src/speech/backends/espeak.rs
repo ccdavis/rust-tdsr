@@ -155,6 +155,13 @@ type EspeakTerminate = unsafe extern "C" fn() -> c_int;
 type EspeakListVoices = unsafe extern "C" fn(*const EspeakVoiceRaw) -> *const *const EspeakVoiceRaw;
 type EspeakNgGetSampleRate = unsafe extern "C" fn() -> c_int;
 type EspeakInfo = unsafe extern "C" fn(*mut *const c_char) -> *const c_char;
+type EspeakTextToPhonemes = unsafe extern "C" fn(*mut *const c_void, c_int, c_int) -> *const c_char;
+type EspeakTextToPhonemesWithTerminator =
+    unsafe extern "C" fn(*mut *const c_void, c_int, c_int, *mut c_int) -> *const c_char;
+
+/// `espeakPHONEMES_IPA`: phoneme output in IPA characters.
+#[cfg_attr(not(feature = "piper"), allow(dead_code))]
+const ESPEAK_PHONEMES_IPA: c_int = 0x02;
 
 /// `espeak_VOICE` from espeak_lib.h.
 #[repr(C)]
@@ -186,6 +193,25 @@ pub(crate) struct Espeak {
     get_sample_rate: Option<EspeakNgGetSampleRate>,
     /// Rate of the PCM it produces with the current voice
     sample_rate: u32,
+    /// Text to IPA phonemes, for Piper voices. The variant that reports each
+    /// clause's punctuation is upstream since 2025 (Alpine patches 1.52).
+    #[cfg_attr(not(feature = "piper"), allow(dead_code))]
+    text_to_phonemes: Option<EspeakTextToPhonemes>,
+    #[cfg_attr(not(feature = "piper"), allow(dead_code))]
+    text_to_phonemes_wt: Option<EspeakTextToPhonemesWithTerminator>,
+    /// Voice selected for speaking with `set_voice`, and the voice now in the
+    /// library, which phonemising for a Piper voice may have changed
+    voice: Option<String>,
+    loaded: Option<String>,
+}
+
+/// One clause of text as IPA phonemes, with espeak-ng's clause terminator
+/// (`CLAUSE_*` in its translate.h; 0 when the library cannot report it).
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(not(feature = "piper"), allow(dead_code))]
+pub(crate) struct PhonemeClause {
+    pub phonemes: String,
+    pub terminator: i32,
 }
 
 impl Espeak {
@@ -220,6 +246,14 @@ impl Espeak {
                 .ok()
                 .map(|f| *f);
             let info = *lib.get::<EspeakInfo>(b"espeak_Info\0").map_err(err)?;
+            let text_to_phonemes = lib
+                .get::<EspeakTextToPhonemes>(b"espeak_TextToPhonemes\0")
+                .ok()
+                .map(|f| *f);
+            let text_to_phonemes_wt = lib
+                .get::<EspeakTextToPhonemesWithTerminator>(b"espeak_TextToPhonemesWithTerminator\0")
+                .ok()
+                .map(|f| *f);
 
             let rate = initialize(
                 AUDIO_OUTPUT_SYNCHRONOUS,
@@ -243,6 +277,10 @@ impl Espeak {
                 info,
                 get_sample_rate,
                 sample_rate: rate as u32,
+                text_to_phonemes,
+                text_to_phonemes_wt,
+                voice: None,
+                loaded: None,
             })
         }
     }
@@ -251,11 +289,8 @@ impl Espeak {
     /// Returns false if espeak-ng could not load it; the library's current
     /// voice is then undefined, so the caller should select another.
     pub(crate) fn set_voice(&mut self, name: &str) -> bool {
-        let Ok(c) = CString::new(name) else {
-            return false;
-        };
-        // SAFETY: valid NUL-terminated string, library initialised.
-        let ok = unsafe { (self.set_voice_by_name)(c.as_ptr()) } == 0;
+        let ok = self.load_voice(name);
+        self.voice = ok.then(|| name.to_string());
         if ok {
             if let Some(get) = self.get_sample_rate {
                 // SAFETY: library initialised.
@@ -268,6 +303,83 @@ impl Espeak {
             warn!("espeak-ng voice '{}' not available", name);
         }
         ok
+    }
+
+    /// Put `name` into the library without changing the voice selected for
+    /// speaking.
+    fn load_voice(&mut self, name: &str) -> bool {
+        if self.loaded.as_deref() == Some(name) {
+            return true;
+        }
+        let Ok(c) = CString::new(name) else {
+            return false;
+        };
+        // SAFETY: valid NUL-terminated string, library initialised.
+        let ok = unsafe { (self.set_voice_by_name)(c.as_ptr()) } == 0;
+        self.loaded = ok.then(|| name.to_string());
+        ok
+    }
+
+    /// Bring back the voice selected for speaking after phonemising with
+    /// another one.
+    fn restore_voice(&mut self) {
+        if let Some(v) = self.voice.clone() {
+            self.load_voice(&v);
+        }
+    }
+
+    /// Whether [`phonemes_ipa`](Self::phonemes_ipa) can work.
+    #[cfg_attr(not(feature = "piper"), allow(dead_code))]
+    pub(crate) fn can_phonemise(&self) -> bool {
+        self.text_to_phonemes_wt.is_some() || self.text_to_phonemes.is_some()
+    }
+
+    /// `text` as IPA phonemes, one entry per clause, with espeak-ng voice
+    /// `voice` (Piper's `espeak.voice`, e.g. `en-us`). None if the voice
+    /// cannot be loaded or the library has no phoneme output.
+    #[cfg_attr(not(feature = "piper"), allow(dead_code))]
+    pub(crate) fn phonemes_ipa(&mut self, voice: &str, text: &str) -> Option<Vec<PhonemeClause>> {
+        if !self.can_phonemise() || !self.load_voice(voice) {
+            return None;
+        }
+        let c = CString::new(text).ok()?;
+        let mut ptr = c.as_ptr() as *const c_void;
+        let mut clauses = Vec::new();
+        while !ptr.is_null() {
+            let mut terminator: c_int = 0;
+            // SAFETY: `ptr` walks the NUL-terminated `c`, which outlives the
+            // loop; espeak-ng advances it clause by clause and sets it to
+            // NULL at the end. The result is its own static buffer, copied
+            // before the next call.
+            let out = unsafe {
+                match self.text_to_phonemes_wt {
+                    Some(f) => f(
+                        &mut ptr,
+                        ESPEAK_CHARS_UTF8 as c_int,
+                        ESPEAK_PHONEMES_IPA,
+                        &mut terminator,
+                    ),
+                    None => (self.text_to_phonemes.expect("checked"))(
+                        &mut ptr,
+                        ESPEAK_CHARS_UTF8 as c_int,
+                        ESPEAK_PHONEMES_IPA,
+                    ),
+                }
+            };
+            let phonemes = if out.is_null() {
+                String::new()
+            } else {
+                // SAFETY: NUL-terminated string owned by the library.
+                unsafe { CStr::from_ptr(out) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            clauses.push(PhonemeClause {
+                phonemes,
+                terminator,
+            });
+        }
+        Some(clauses)
     }
 
     /// espeak-ng's data directory (where it looks for MBROLA databases
@@ -358,7 +470,8 @@ impl Espeak {
 
     /// Synthesise `text`, delivering PCM to the callback until it is done or
     /// the callback asks to stop.
-    pub(crate) fn synth(&self, text: &str, end_pause: bool) {
+    pub(crate) fn synth(&mut self, text: &str, end_pause: bool) {
+        self.restore_voice();
         let Ok(c) = CString::new(text) else { return };
         let flags = ESPEAK_CHARS_UTF8 | if end_pause { ESPEAK_ENDPAUSE } else { 0 };
         // SAFETY: `c` outlives the (synchronous) call; size includes the NUL.
@@ -383,7 +496,7 @@ impl Espeak {
     /// Synthesise `text` with the chunks delivered to `sink` (for a library
     /// loaded with [`chunk_callback`]); `sink` returns false to stop.
     pub(crate) fn synth_to(
-        &self,
+        &mut self,
         text: &str,
         end_pause: bool,
         sink: &mut dyn FnMut(&[i16]) -> bool,

@@ -25,8 +25,16 @@ native-speech = ["dep:speech-dispatcher"]
 # with DECTALK_LIB_DIR pointing at the directory holding libdectalk.a (see
 # the accessible_os alpine/src/dectalk Makefile).
 dectalk = []
+# `piper` adds Piper neural voices to the ALSA backend, run with rten (pure
+# Rust ONNX inference); voices are .onnx + .onnx.json files (`piper_voices`).
+piper = ["dep:rten", "dep:rten-tensor", "dep:unicode-normalization"]
 
 [dependencies]
+# Piper voices (feature `piper`)
+rten = { version = "0.26", optional = true, default-features = false, features = ["onnx_format", "random"] }
+rten-tensor = { version = "0.26", optional = true }
+unicode-normalization = { version = "0.1", optional = true }
+
 # Terminal emulation
 vte = "0.13"
 portable-pty = "0.8"

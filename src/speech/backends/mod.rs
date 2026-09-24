@@ -23,6 +23,10 @@ pub mod pulseaudio;
 #[cfg(target_os = "linux")]
 pub mod alsa;
 
+// Piper neural voices for the ALSA backend (feature `piper`)
+#[cfg(all(target_os = "linux", feature = "piper"))]
+pub mod piper;
+
 // macOS AVFoundation backend, run as a `tdsr --speech-server` subprocess
 #[cfg(target_os = "macos")]
 pub mod avfoundation;

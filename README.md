@@ -170,17 +170,33 @@ sound card itself:
 backend = alsa          ; or TDSR_BACKEND=alsa in the environment
 alsa_device = default   ; any ALSA PCM name, e.g. plughw:1
 alsa_buffer = 50        ; ms queued in the device; a cancel drops at most this much
-engine = espeak         ; engine at start-up: espeak or dectalk
+engine = espeak         ; engine at start-up: espeak, dectalk or piper
 dectalk_rate = 50       ; DECtalk's own rate (rate applies to espeak-ng); alt+c r
                         ; sets and saves the rate of the engine speaking
 dectalk_voice = paul    ; paul betty harry frank dennis kit ursula rita wendy
+piper_rate = 50         ; Piper's own rate (0-100, 50 is the voice's natural speed)
+piper_voice = en_US-joe-medium   ; voice at start-up (default: the first found)
+piper_voices = /usr/share/piper-voices   ; `:`-separated directories of Piper voices
 ```
 
 `libasound` and `libespeak-ng` are loaded at run time. DECtalk is optional: build with
 `--features dectalk` and `DECTALK_LIB_DIR` pointing at a directory holding `libdectalk.a`
 (the accessible_os project builds one from the `dectalk/dectalk` sources). With both engines
-loaded, **Alt+s** switches between them and announces the new one; DECtalk voices appear as
+loaded, **Alt+s** steps through them and announces the new one; DECtalk voices appear as
 `dectalk:paul` etc. after the espeak-ng voices in the configuration menu.
+
+Piper neural voices are optional too: build with `--features piper`. They run in-process with
+[rten](https://github.com/robertknight/rten) (pure Rust ONNX inference, so no ONNX Runtime
+library is needed and 32-bit x86 works), and espeak-ng turns the text into phonemes exactly as
+Piper does (`espeak_TextToPhonemesWithTerminator`, upstream espeak-ng since 2025, patched into
+Alpine's 1.52). A voice is a `NAME.onnx` file with its `NAME.onnx.json` from
+[piper-voices](https://huggingface.co/rhasspy/piper-voices), placed in one of the `piper_voices`
+directories (default `~/.local/share/piper-voices:/usr/share/piper-voices`); they appear as
+`piper:en_US-joe-medium` after the DECtalk voices. Each sentence is synthesised whole (Piper's
+intonation spans the sentence), the next one while the current one plays; a cancel silences at
+once, and the sentence still being synthesised is dropped in the background. A voice is loaded
+when first used: about 100 MB of RAM, 240 MB at the peak while loading. Speed on one core of a
+recent desktop: about 12x real time on x86_64, 4x on 32-bit x86 (rten's fast kernels need AVX2).
 
 ### TUI Mode (menus and dialogs)
 

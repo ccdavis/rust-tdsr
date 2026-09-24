@@ -349,7 +349,8 @@ impl Config {
     }
 
     /// Options of the ALSA backend (`[speech]`: alsa_device, engine, rate,
-    /// dectalk_rate, dectalk_voice, alsa_buffer).
+    /// dectalk_rate, dectalk_voice, alsa_buffer, piper_rate, piper_voice,
+    /// piper_voices).
     #[cfg(target_os = "linux")]
     pub fn alsa_options(&self) -> crate::speech::backends::alsa::AlsaOptions {
         let d = crate::speech::backends::alsa::AlsaOptions::default();
@@ -364,6 +365,11 @@ impl Config {
             buffer_ms: self
                 .get_int("speech", "alsa_buffer", d.buffer_ms as i32)
                 .clamp(10, 1000) as u32,
+            piper_rate: self
+                .get_int("speech", "piper_rate", d.piper_rate as i32)
+                .clamp(0, 100) as u8,
+            piper_voice: self.get_string("speech", "piper_voice", &d.piper_voice),
+            piper_voices: self.get_string("speech", "piper_voices", &d.piper_voices),
         }
     }
 

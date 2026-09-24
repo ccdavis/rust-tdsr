@@ -54,6 +54,7 @@ fn main() {
             Ok(log_file) => {
                 env_logger::Builder::new()
                     .filter_level(log::LevelFilter::Debug)
+                    .format_timestamp_millis()
                     .target(env_logger::Target::Pipe(Box::new(log_file)))
                     .init();
             }

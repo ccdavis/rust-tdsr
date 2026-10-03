@@ -189,7 +189,10 @@ impl RhvoiceEngine {
         // SAFETY: a known library and its documented entry points; the
         // structures above follow RHVoice.h and RHVoice_common.h.
         unsafe {
+            // The soname differs between builds of the same C API: 1 in
+            // upstream's CMake builds (Alpine), 5 in Debian/Ubuntu's.
             let lib = Library::new("libRHVoice.so.1")
+                .or_else(|_| Library::new("libRHVoice.so.5"))
                 .map_err(|e| TdsrError::Speech(format!("libRHVoice not available: {}", e)))?;
             let new_engine = *lib
                 .get::<NewEngine>(b"RHVoice_new_tts_engine\0")

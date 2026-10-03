@@ -89,6 +89,62 @@ cargo install --path .
 sudo cp target/release/tdsr /usr/local/bin/
 ```
 
+### All the voices (Linux)
+
+The Linux default is whatever Speech Dispatcher is set up to speak with. To get every engine
+TDSR can run itself (espeak-ng, MBROLA, RHVoice, SVOX Pico and the Piper neural voices) and
+switch between them with **Alt+s**:
+
+1. **Install the engines and voices.** On Debian and Ubuntu:
+
+   ```bash
+   ./install-voices.sh
+   ```
+
+   It asks for your password to install the packages (`espeak-ng`, `mbrola` with four English
+   voices, `librhvoice5`, `rhvoice-english`, `libttspico0`, `libttspico-data`) and downloads
+   nine English Piper voices, about 760 MB, into `~/.local/share/piper-voices`. MBROLA voices,
+   RHVoice and Pico come from Ubuntu's `multiverse` (Debian: `contrib` and `non-free`); the
+   script says which packages your sources do not offer. On other distributions install the
+   same things with your package manager and run `./install-voices.sh --no-packages` for the
+   Piper voices alone.
+
+   To choose the Piper voices yourself, name them:
+   `./install-voices.sh --no-packages en_US-ryan-high de_DE-thorsten-high`. The names are
+   those on [piper-voices](https://huggingface.co/rhasspy/piper-voices). `high` voices sound
+   best; `medium` ones start speaking sooner.
+
+2. **Build TDSR with Piper support:**
+
+   ```bash
+   cargo build --release --features piper
+   ```
+
+3. **Select the ALSA backend,** which is the one that runs the engines, in `~/.tdsr.cfg`:
+
+   ```ini
+   [speech]
+   backend = alsa
+   ```
+
+4. **Start TDSR** (`./target/release/tdsr`) and press **Alt+s**: each press moves to the next
+   engine and says its name. If Alt+s answers "this speech backend has one engine", step 3 is
+   missing. An engine whose library or voices are not installed is left out; `tdsr --debug`
+   writes the engines and voices it found to `tdsr.log` ("ALSA backend ready, engines ...").
+
+Each engine has a default voice. To choose another, add any of these to `[speech]`:
+
+```ini
+engine = piper                 ; engine at start-up: espeak, mbrola, piper, rhvoice or pico
+piper_voice = en_US-ryan-high  ; a file name in ~/.local/share/piper-voices, without .onnx
+rhvoice_voice = slt            ; alan bdl clb slt
+pico_voice = en-GB             ; en-US en-GB de-DE es-ES fr-FR it-IT
+mbrola_voice = us2             ; us1 us2 us3 en1
+```
+
+DECtalk is a sixth engine, linked in at build time; it and the remaining options are described
+under [ALSA backend](#alsa-backend-in-process-engines-no-sound-server-linux).
+
 ## Quick Start
 
 ```bash
@@ -197,7 +253,7 @@ espeak-ng's installed MBROLA voices are also an engine of their own (`mbrola`, v
 `mbrola:us1`), with its own rate: diphone voices need a much slower rate than espeak-ng's own.
 Both engines share one espeak-ng, and each sets its voice, rate and volume before speaking.
 
-RHVoice (`libRHVoice.so.1`, a statistical voice made for screen readers) and SVOX Pico
+RHVoice (`libRHVoice.so.1` or Debian/Ubuntu's `libRHVoice.so.5`, a statistical voice made for screen readers) and SVOX Pico
 (`libttspico.so.0`, from the `picotts` package) are loaded at run time when present, like
 espeak-ng; their voices appear as `rhvoice:slt` and `pico:en-GB`. A cancel stops either at
 once (RHVoice through its speech callback, Pico between its output steps). If the device
@@ -392,7 +448,7 @@ character review all work, and `Alt+o` or `Alt+O` come back down.
 - `Alt+r` - Start/end selection (then Alt+r again to copy)
 - `Alt+v` - Copy mode (then 'l' for line, 's' for screen)
 - `Alt+x` - Silence speech
-- **Alt+s** - Switch speech engine (ALSA backend: espeak-ng / DECtalk)
+- `Alt+s` - Switch speech engine (ALSA backend: espeak-ng, MBROLA, DECtalk, Piper, RHVoice, Pico)
 
 ### TUI Mode
 - `Alt+t` - Cycle TUI mode: auto, apps, on, off

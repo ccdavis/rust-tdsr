@@ -393,6 +393,16 @@ impl Engine for PicoEngine {
         Ok(format!("Pico {}", self.voices[i].name))
     }
 
+    fn next_voice(&mut self) -> std::result::Result<(String, String), String> {
+        if self.voices.len() <= 1 {
+            return Err("only one Pico voice is installed".to_string());
+        }
+        let next = (self.current + 1) % self.voices.len();
+        let id = self.voices[next].name.clone();
+        let spoken = self.set_voice(&id)?;
+        Ok((format!("{}{}", VOICE_PREFIX, id), spoken))
+    }
+
     fn synth(&mut self, text: &str, is_letter: bool, sink: &mut dyn FnMut(&[i16]) -> bool) {
         let british = self.voices[self.current].name == "en-GB";
         let english = self.voices[self.current].name.starts_with("en");

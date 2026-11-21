@@ -119,13 +119,40 @@ fn main() {
 }
 
 /// `tdsr --list-voices` on Linux/WSL: the voices of the backend `create_synth`
-/// would pick, with the index each has as `voice_idx`. On native Linux that
-/// is Speech Dispatcher when it answers; otherwise (and on WSL) the espeak-ng
-/// catalogue, from the in-process library when it loads, else the espeak-ng
-/// program.
+/// would pick, with the index each has in the config menu (Alt+c, V).
+/// When the multi-engine backend is active (`backend = alsa` / `pulse`, or
+/// WSL default), lists every loaded engine's voices in index order; on native
+/// Linux `auto`, tries Speech Dispatcher first, then espeak-ng.
 #[cfg(not(target_os = "macos"))]
 fn list_espeak_voices() -> ! {
     use tdsr::speech::voices::VoiceCatalogue;
+
+    #[cfg(target_os = "linux")]
+    {
+        let config = tdsr::state::config::Config::load_existing();
+        let backend = std::env::var("TDSR_BACKEND")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| config.as_ref().and_then(|c| c.backend()))
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let multi_engine = matches!(backend.as_str(), "alsa" | "pulse" | "pulseaudio")
+            || (is_wsl() && matches!(backend.as_str(), "" | "auto"));
+        if multi_engine {
+            let opts = config
+                .as_ref()
+                .map(|c| c.alsa_options())
+                .unwrap_or_default();
+            match tdsr::speech::backends::alsa::list_voices(&opts) {
+                Ok(listing) => {
+                    print!("{}", listing);
+                    process::exit(0);
+                }
+                Err(e) => debug!("Multi-engine voice listing unavailable ({})", e),
+            }
+        }
+    }
 
     #[cfg(all(feature = "native-speech", not(target_os = "macos")))]
     if !is_wsl() {

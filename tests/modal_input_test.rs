@@ -14,8 +14,9 @@ use tdsr::Result;
 const MOCK_VOICES: &[(&str, &str)] = &[("gmw/af", "Afrikaans"), ("gmw/en-US", "English (America)")];
 
 /// Synth that records every command instead of speaking; the second field
-/// is the config key of its current engine's rate.
-struct RecordingSynth(Arc<Mutex<Vec<SpeechCommand>>>, &'static str);
+/// is the config key of its current engine's rate, and the third tracks the
+/// mock voice rotation for `next_voice`.
+struct RecordingSynth(Arc<Mutex<Vec<SpeechCommand>>>, &'static str, usize);
 
 impl Synth for RecordingSynth {
     fn send(&mut self, cmd: SpeechCommand) -> Result<()> {
@@ -66,6 +67,23 @@ impl Synth for RecordingSynth {
     fn rate_key(&self) -> &'static str {
         self.1
     }
+    fn voice_key(&self, id: &str) -> &'static str {
+        if id.starts_with("piper:") {
+            "piper_voice"
+        } else {
+            "voice"
+        }
+    }
+    fn next_voice(&mut self) -> Result<(String, String)> {
+        let choices = [
+            ("piper:en_US-joe-medium", "joe, US English"),
+            ("piper:en_US-ryan-high", "ryan, US English"),
+        ];
+        let next = self.2 % choices.len();
+        self.2 += 1;
+        self.send(SpeechCommand::SetVoiceIdx(next))?;
+        Ok((choices[next].0.to_string(), choices[next].1.to_string()))
+    }
 }
 
 struct Harness {
@@ -96,7 +114,7 @@ impl Harness {
         }
         let config = Config::load_from(path).unwrap();
         let spoken = Arc::new(Mutex::new(Vec::new()));
-        let synth = Box::new(RecordingSynth(spoken.clone(), rate_key));
+        let synth = Box::new(RecordingSynth(spoken.clone(), rate_key, 0));
         let state = State::from_parts(config, synth, 20, 5).unwrap();
         Self {
             state,
@@ -508,4 +526,30 @@ fn review_cursor_reads_lines_that_scrolled_off_the_top() {
     h.feed(b"\x1bi");
     assert_eq!(h.state.review.above, 1);
     assert_eq!(h.spoken_text(), vec!["l7"]);
+}
+
+#[test]
+fn alt_a_steps_through_voices_and_saves_to_config() {
+    let mut h = Harness::new();
+    h.clear_spoken();
+
+    assert!(h.feed(b"\x1ba").is_empty(), "Alt+a should not leak to PTY");
+    assert_eq!(h.spoken_text(), vec!["joe, US English".to_string()]);
+    assert_eq!(
+        h.state.config.get_string("speech", "piper_voice", ""),
+        "piper:en_US-joe-medium"
+    );
+
+    h.clear_spoken();
+    assert!(h.feed(b"\x1ba").is_empty());
+    assert_eq!(h.spoken_text(), vec!["ryan, US English".to_string()]);
+    assert_eq!(
+        h.state.config.get_string("speech", "piper_voice", ""),
+        "piper:en_US-ryan-high"
+    );
+
+    // Wraps back around
+    h.clear_spoken();
+    assert!(h.feed(b"\x1ba").is_empty());
+    assert_eq!(h.spoken_text(), vec!["joe, US English".to_string()]);
 }

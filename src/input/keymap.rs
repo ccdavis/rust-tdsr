@@ -49,8 +49,10 @@ pub enum KeyAction {
     SelectionStart,
     CopyMode,
     Silence,
-    /// Switch speech engine (ALSA backend: espeak-ng / DECtalk)
+    /// Switch speech engine (multi-engine backend: espeak-ng, MBROLA, DECtalk, Piper, RHVoice, Pico)
     SwitchEngine,
+    /// Step to the next voice within the current speech engine
+    SwitchVoice,
 
     // TUI mode (full-screen programs)
     /// Cycle TUI mode: auto, on, off
@@ -109,6 +111,7 @@ pub fn create_default_keymap() -> HashMap<KeySequence, KeyAction> {
     map.insert(b"\x1bv".to_vec(), KeyAction::CopyMode);
     map.insert(b"\x1bx".to_vec(), KeyAction::Silence);
     map.insert(b"\x1bs".to_vec(), KeyAction::SwitchEngine);
+    map.insert(b"\x1ba".to_vec(), KeyAction::SwitchVoice);
 
     // TUI mode (alt+t cycle, alt+w read window, alt+h repeat highlight)
     map.insert(b"\x1bt".to_vec(), KeyAction::TuiModeCycle);

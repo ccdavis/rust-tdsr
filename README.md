@@ -89,25 +89,26 @@ cargo install --path .
 sudo cp target/release/tdsr /usr/local/bin/
 ```
 
-### All the voices (Linux)
+### All the voices (Linux & WSL2)
 
-The Linux default is whatever Speech Dispatcher is set up to speak with. To get every engine
+The native Linux default is whatever Speech Dispatcher is set up to speak with; on **WSL2**,
+TDSR enables all installed engines automatically over WSLg PulseAudio. To get every engine
 TDSR can run itself (espeak-ng, MBROLA, RHVoice, SVOX Pico and the Piper neural voices) and
 switch between them with **Alt+s**:
 
-1. **Install the engines and voices.** On Debian and Ubuntu:
+1. **Install the engines and voices.** On Debian and Ubuntu (including WSL2):
 
    ```bash
    ./install-voices.sh
    ```
 
    It asks for your password to install the packages (`espeak-ng`, `mbrola` with four English
-   voices, `librhvoice5`, `rhvoice-english`, `libttspico0`, `libttspico-data`) and downloads
-   nine English Piper voices, about 760 MB, into `~/.local/share/piper-voices`. MBROLA voices,
-   RHVoice and Pico come from Ubuntu's `multiverse` (Debian: `contrib` and `non-free`); the
-   script says which packages your sources do not offer. On other distributions install the
-   same things with your package manager and run `./install-voices.sh --no-packages` for the
-   Piper voices alone.
+   voices, `librhvoice5`, `rhvoice-english`, `libttspico0`, `libttspico-data`, `libasound2-plugins`)
+   and downloads nine English Piper voices, about 760 MB, into `~/.local/share/piper-voices`.
+   MBROLA voices, RHVoice and Pico come from Ubuntu's `multiverse` (Debian: `contrib` and
+   `non-free`); the script says which packages your sources do not offer. On other distributions
+   install the same things with your package manager and run `./install-voices.sh --no-packages`
+   for the Piper voices alone.
 
    To choose the Piper voices yourself, name them:
    `./install-voices.sh --no-packages en_US-ryan-high de_DE-thorsten-high`. The names are
@@ -117,20 +118,22 @@ switch between them with **Alt+s**:
 2. **Build TDSR with Piper support:**
 
    ```bash
-   cargo build --release --features piper
+   ./build.sh --piper    # or: cargo build --release --features piper
    ```
 
-3. **Select the ALSA backend,** which is the one that runs the engines, in `~/.tdsr.cfg`:
+3. **Select the multi-engine backend** (native Linux only — **not needed on WSL2**, where
+   TDSR uses the multi-engine PulseAudio backend automatically):
 
    ```ini
    [speech]
-   backend = alsa
+   backend = alsa        ; direct ALSA (console/no sound server), or `backend = pulse` on PulseAudio/PipeWire
    ```
 
 4. **Start TDSR** (`./target/release/tdsr`) and press **Alt+s**: each press moves to the next
-   engine and says its name. If Alt+s answers "this speech backend has one engine", step 3 is
-   missing. An engine whose library or voices are not installed is left out; `tdsr --debug`
-   writes the engines and voices it found to `tdsr.log` ("ALSA backend ready, engines ...").
+   engine and says its name. Run `./target/release/tdsr --list-voices` to see every loaded
+   engine and voice index. If Alt+s answers "this speech backend has one engine" on native Linux,
+   step 3 is missing. An engine whose library or voices are not installed is left out; `tdsr --debug`
+   writes the engines and voices it found to `tdsr.log` ("Multi-engine backend ready ...").
 
 Each engine has a default voice. To choose another, add any of these to `[speech]`:
 
@@ -448,7 +451,8 @@ character review all work, and `Alt+o` or `Alt+O` come back down.
 - `Alt+r` - Start/end selection (then Alt+r again to copy)
 - `Alt+v` - Copy mode (then 'l' for line, 's' for screen)
 - `Alt+x` - Silence speech
-- `Alt+s` - Switch speech engine (ALSA backend: espeak-ng, MBROLA, DECtalk, Piper, RHVoice, Pico)
+- `Alt+s` - Switch speech engine (multi-engine backend: espeak-ng, MBROLA, DECtalk, Piper, RHVoice, Pico)
+- `Alt+a` - Step to the next voice within the current speech engine (saved to `~/.tdsr.cfg`)
 
 ### TUI Mode
 - `Alt+t` - Cycle TUI mode: auto, apps, on, off

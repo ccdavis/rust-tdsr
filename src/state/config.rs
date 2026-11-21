@@ -41,6 +41,13 @@ impl Config {
         Self::load_from(Self::config_path())
     }
 
+    /// Load configuration from `~/.tdsr.cfg` if it already exists, without
+    /// creating a default file (for read-only commands such as `--list-voices`).
+    pub fn load_existing() -> Option<Self> {
+        let path = Self::config_path();
+        path.exists().then(|| Self::load_from(path).ok()).flatten()
+    }
+
     /// Load configuration from an explicit path, creating it with defaults if
     /// absent. Later `save()` calls write back to the same path.
     pub fn load_from(path: PathBuf) -> Result<Self> {

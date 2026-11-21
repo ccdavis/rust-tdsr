@@ -193,6 +193,7 @@ pub fn list_voices() -> Result<String> {
 pub struct SpeechDispatcherSynth {
     conn: Connection,
     voices: Vec<SpdVoice>,
+    current_voice: Option<usize>,
 }
 
 impl SpeechDispatcherSynth {
@@ -207,7 +208,11 @@ impl SpeechDispatcherSynth {
                 .map(|m| format!(", module {}", m))
                 .unwrap_or_default()
         );
-        Ok(Self { conn, voices })
+        Ok(Self {
+            conn,
+            voices,
+            current_voice: None,
+        })
     }
 
     /// The voices the daemon offers, in `voice_idx` order.
@@ -283,7 +288,22 @@ impl Synth for SpeechDispatcherSynth {
         self.conn
             .set_synthesis_voice(&spd_voice)
             .map_err(|e| Self::spd_err("set voice", e))?;
+        self.current_voice = self.voices.iter().position(|v| v.name == voice.name);
         Ok(voice.describe())
+    }
+
+    fn next_voice(&mut self) -> Result<(String, String)> {
+        let Some(next) = next_voice_index(self.voices.len(), self.current_voice) else {
+            let msg = if self.voices.is_empty() {
+                "Speech Dispatcher reports no voices"
+            } else {
+                "only one Speech Dispatcher voice is available"
+            };
+            return Err(TdsrError::Speech(msg.to_string()));
+        };
+        let id = self.voices[next].name.clone();
+        let spoken = self.set_voice(&id)?;
+        Ok((id, spoken))
     }
 
     fn voice_count(&self) -> Option<usize> {
@@ -327,6 +347,14 @@ impl Synth for SpeechDispatcherSynth {
         debug!("Canceling speech");
         self.conn.cancel().map_err(|e| Self::spd_err("cancel", e))
     }
+}
+
+/// Next voice index wrapping around, or `None` when fewer than two voices exist.
+fn next_voice_index(len: usize, current: Option<usize>) -> Option<usize> {
+    if len <= 1 {
+        return None;
+    }
+    Some(current.map(|i| (i + 1) % len).unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -379,6 +407,11 @@ mod tests {
         assert!(listing.contains("output module espeak-ng"));
         assert!(listing.contains("1  en-US           English (America)\n"));
         assert!(render_voices(None, &[]).contains("lists no voices"));
+        assert_eq!(next_voice_index(0, None), None);
+        assert_eq!(next_voice_index(1, Some(0)), None);
+        assert_eq!(next_voice_index(3, None), Some(0));
+        assert_eq!(next_voice_index(3, Some(0)), Some(1));
+        assert_eq!(next_voice_index(3, Some(2)), Some(0));
     }
 
     #[test]

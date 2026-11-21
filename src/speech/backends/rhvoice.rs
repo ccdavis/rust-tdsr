@@ -377,6 +377,16 @@ impl Engine for RhvoiceEngine {
         Ok(format!("R H voice {}", self.voices[i]))
     }
 
+    fn next_voice(&mut self) -> std::result::Result<(String, String), String> {
+        if self.voices.len() <= 1 {
+            return Err("only one R H voice is installed".to_string());
+        }
+        let next = (self.current + 1) % self.voices.len();
+        let id = self.voices[next].to_ascii_lowercase();
+        let spoken = self.set_voice(&id)?;
+        Ok((format!("{}{}", VOICE_PREFIX, id), spoken))
+    }
+
     fn synth(&mut self, text: &str, is_letter: bool, sink: &mut dyn FnMut(&[i16]) -> bool) {
         let single = text.trim().chars().count() == 1;
         let kind = if is_letter && single {

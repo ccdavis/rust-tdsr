@@ -660,6 +660,19 @@ impl State {
         self.synth.next_engine()
     }
 
+    /// Step to the next voice of the current speech engine (alt+a), saving
+    /// the selection to config and returning its spoken name.
+    pub fn next_voice(&mut self) -> Result<String> {
+        let (id, name) = self.synth.next_voice()?;
+        let key = self.synth.voice_key(&id);
+        self.config.set("speech", key, &id);
+        if key == "voice" {
+            self.config.remove("speech", "voice_idx");
+        }
+        self.save_config()?;
+        Ok(name)
+    }
+
     // ========== Review Cursor Navigation ==========
     // These methods implement the screen reader's review cursor for
     // navigating and reading screen content independently of the terminal cursor

@@ -104,10 +104,19 @@ pub trait Synth: Send {
     }
 
     /// Switch to the backend's next speech engine (alt+s) and return its
-    /// spoken name. Only the ALSA backend has more than one.
+    /// spoken name. Only the multi-engine backend has more than one.
     fn next_engine(&mut self) -> Result<String> {
         Err(crate::TdsrError::Speech(
             "this speech backend has one engine".to_string(),
+        ))
+    }
+
+    /// Step to the next voice of the current engine (alt+a) and return
+    /// `(persistent_id, spoken_name)` so the selection can be saved and
+    /// announced.
+    fn next_voice(&mut self) -> Result<(String, String)> {
+        Err(crate::TdsrError::Speech(
+            "this speech backend cannot step through voices".to_string(),
         ))
     }
 }
@@ -138,9 +147,12 @@ fn try_espeak_in_process() -> Option<Box<dyn Synth>> {
 /// Automatically detects the environment and selects the best backend:
 ///
 /// **WSL (Windows Subsystem for Linux):**
-/// 1. PulseAudio + espeak-ng (lowest latency, direct audio)
-/// 2. Windows SAPI via PowerShell (if espeak-ng not installed)
-/// 3. Speech Dispatcher (if SAPI unavailable)
+/// 1. Multi-engine in-process backend (espeak-ng, MBROLA, Piper, RHVoice,
+///    Pico, DECtalk) over TDSR-managed WSLg PulseAudio
+/// 2. In-process espeak-ng + PulseAudio (fallback)
+/// 3. espeak-ng subprocesses + PulseAudio
+/// 4. Windows SAPI via PowerShell (if PulseAudio / espeak-ng unavailable)
+/// 5. Speech Dispatcher (if SAPI unavailable)
 ///
 /// **Native Linux:**
 /// 1. Speech Dispatcher (standard Linux TTS, respects system preferences)
@@ -157,12 +169,13 @@ fn try_espeak_in_process() -> Option<Box<dyn Synth>> {
 ///
 /// All backends provide helpful error messages when unavailable.
 pub fn create_synth(speech_command: Option<&str>) -> Result<Box<dyn Synth>> {
-    create_synth_with(speech_command, None)
+    create_synth_with(speech_command, None, None)
 }
 
 /// [`create_synth`] with the config's backend choice: `[speech] backend =
-/// alsa` (or `TDSR_BACKEND=alsa`) selects the in-process ALSA backend with
-/// its `[speech]` options; anything else takes the platform chain.
+/// alsa` or `pulse` (or `TDSR_BACKEND=...`) selects the multi-engine
+/// in-process backend with its `[speech]` options; anything else takes the
+/// platform chain.
 pub fn create_synth_for(
     config: &crate::state::config::Config,
     speech_command: Option<&str>,
@@ -171,22 +184,23 @@ pub fn create_synth_for(
         .ok()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| config.backend());
-    create_synth_with(speech_command, backend.as_deref().map(|b| (b, config)))
+    create_synth_with(speech_command, backend.as_deref(), Some(config))
 }
 
 fn create_synth_with(
     speech_command: Option<&str>,
-    backend: Option<(&str, &crate::state::config::Config)>,
+    backend: Option<&str>,
+    config: Option<&crate::state::config::Config>,
 ) -> Result<Box<dyn Synth>> {
     let platform = std::env::consts::OS;
 
-    if let Some((name, config)) = backend {
+    if let Some(name) = backend {
         match name.trim().to_ascii_lowercase().as_str() {
             "alsa" => {
                 #[cfg(target_os = "linux")]
                 {
                     info!("Using the ALSA in-process backend");
-                    let opts = config.alsa_options();
+                    let opts = config.map(|c| c.alsa_options()).unwrap_or_default();
                     return Ok(Box::new(super::backends::alsa::AlsaSynth::new(opts)?));
                 }
                 #[cfg(not(target_os = "linux"))]
@@ -197,10 +211,25 @@ fn create_synth_with(
                     ));
                 }
             }
+            "pulse" | "pulseaudio" => {
+                #[cfg(target_os = "linux")]
+                {
+                    info!("Using the PulseAudio multi-engine in-process backend");
+                    let opts = config.map(|c| c.alsa_options()).unwrap_or_default();
+                    return Ok(Box::new(super::backends::alsa::AlsaSynth::new_pulse(opts)?));
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = config;
+                    return Err(crate::TdsrError::Speech(
+                        "the pulse backend is only available on Linux".to_string(),
+                    ));
+                }
+            }
             "auto" | "" => {}
             other => {
                 return Err(crate::TdsrError::Speech(format!(
-                    "unknown speech backend '{}' (use alsa or auto)",
+                    "unknown speech backend '{}' (use alsa, pulse or auto)",
                     other
                 )))
             }
@@ -225,8 +254,25 @@ fn create_synth_with(
     if platform == "linux" && is_wsl() {
         info!("Detected WSL environment");
 
-        // In-process espeak-ng with our own PulseAudio playback first: it is
-        // the only backend that keeps WSLg's audio pipeline responsive.
+        // Multi-engine in-process backend over WSLg-managed PulseAudio first:
+        // gives WSL2 all installed engines (espeak-ng, MBROLA, Piper, RHVoice,
+        // Pico, DECtalk) with Alt+s switching and WSLg's low-latency playback.
+        #[cfg(target_os = "linux")]
+        {
+            info!("Trying multi-engine PulseAudio backend...");
+            let opts = config.map(|c| c.alsa_options()).unwrap_or_default();
+            match super::backends::alsa::AlsaSynth::new_pulse(opts) {
+                Ok(synth) => {
+                    info!("✓ Successfully initialized multi-engine PulseAudio backend");
+                    return Ok(Box::new(synth));
+                }
+                Err(e) => {
+                    info!("✗ Multi-engine PulseAudio backend unavailable: {}", e);
+                }
+            }
+        }
+
+        // Fallback: single-engine in-process espeak-ng with PulseAudio playback
         if let Some(synth) = try_espeak_in_process() {
             return Ok(synth);
         }

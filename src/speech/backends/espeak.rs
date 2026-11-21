@@ -75,7 +75,7 @@ use std::time::{Duration, Instant};
 /// Rate of the keep-alive monitor stream, and of playback for espeak-ng's
 /// own voices (22050 Hz, upsampled 2x). Playback runs at twice whatever the
 /// current voice produces.
-const OUTPUT_RATE: u32 = 44100;
+pub(crate) const OUTPUT_RATE: u32 = 44100;
 
 /// Length of the PCM chunks espeak-ng hands to the callback.
 const CHUNK_MS: c_int = 20;
@@ -646,7 +646,7 @@ type PaStrerror = unsafe extern "C" fn(c_int) -> *const c_char;
 
 /// The PulseAudio simple API. Shared (read-only) by the audio and keep-alive
 /// threads; each stream is used by one thread only.
-struct Pulse {
+pub(crate) struct Pulse {
     _simple: Library,
     _core: Library,
     new: PaSimpleNew,
@@ -656,13 +656,14 @@ struct Pulse {
     free: PaSimpleFree,
     get_latency: PaSimpleGetLatency,
     /// Playback streams opened so far (for measurements)
+    #[cfg_attr(not(test), allow(dead_code))]
     opens: AtomicU32,
 
     strerror: PaStrerror,
 }
 
 impl Pulse {
-    fn load() -> Result<Arc<Self>> {
+    pub(crate) fn load() -> Result<Arc<Self>> {
         let err = |e: libloading::Error| TdsrError::Speech(format!("libpulse: {}", e));
         // SAFETY: as for Espeak::load; signatures match pulse/simple.h.
         unsafe {
@@ -752,7 +753,7 @@ impl Pulse {
 
     /// A playback stream with a small server-side buffer that starts playing
     /// as soon as data arrives.
-    fn open_playback(self: &Arc<Self>, rate: u32) -> Result<Stream> {
+    pub(crate) fn open_playback(self: &Arc<Self>, rate: u32) -> Result<Stream> {
         self.opens.fetch_add(1, Ordering::Relaxed);
         let attr = PaBufferAttr {
             maxlength: PA_INVALID,
@@ -781,10 +782,25 @@ impl Pulse {
             &attr,
         )
     }
+
+    /// On WSL, hold a monitor recording of the default sink until `shutdown`
+    /// is set so WSLg's RDP sink never suspends and bursts a backlog.
+    pub(crate) fn spawn_keepalive(self: &Arc<Self>, shutdown: Arc<AtomicBool>) {
+        if !is_wsl() {
+            return;
+        }
+        let ka_pulse = Arc::clone(self);
+        if let Err(e) = thread::Builder::new()
+            .name("tdsr-keepalive".to_string())
+            .spawn(move || keepalive_thread(ka_pulse, shutdown))
+        {
+            warn!("Could not start sink keep-alive thread: {}", e);
+        }
+    }
 }
 
 /// One PulseAudio stream; freed on drop.
-struct Stream {
+pub(crate) struct Stream {
     pulse: Arc<Pulse>,
     handle: *mut c_void,
 }
@@ -893,7 +909,7 @@ struct Shared {
     wake: Condvar,
     /// Abort the current utterance and drop what is buffered
     cancel: AtomicBool,
-    shutdown: AtomicBool,
+    shutdown: Arc<AtomicBool>,
     /// Rate espeak-ng produces with the voice in use (0 until known).
     sample_rate: AtomicU32,
 }
@@ -901,6 +917,10 @@ struct Shared {
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, Queue> {
         self.queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst)
     }
 }
 
@@ -915,43 +935,50 @@ enum Job {
 
 // ---- audio thread ---------------------------------------------------------
 
+#[derive(Clone, Copy)]
+struct CallbackCtx {
+    player: *mut PulsePlayer,
+    shared: *const Shared,
+}
+
 thread_local! {
-    /// The player the espeak-ng callback delivers to (set around each
-    /// `espeak_Synth` call on the audio thread).
-    static PLAYER: Cell<*mut Player> = const { Cell::new(ptr::null_mut()) };
+    /// The player and cancel state the espeak-ng callback delivers to (set
+    /// around each `espeak_Synth` call on the audio thread).
+    static PLAYER: Cell<Option<CallbackCtx>> = const { Cell::new(None) };
 }
 
 unsafe extern "C" fn synth_callback(wav: *mut i16, count: c_int, _events: *mut c_void) -> c_int {
-    let player = PLAYER.with(|p| p.get());
-    if player.is_null() {
+    let Some(ctx) = PLAYER.with(|p| p.get()) else {
         return 1;
-    }
+    };
     if wav.is_null() {
         // End of synthesis; the trailing pause is handled after the call.
         return 0;
     }
-    // SAFETY: espeak hands us `count` valid samples; the player pointer is
-    // set by the thread that owns the player, for the duration of the call.
+    // SAFETY: espeak hands us `count` valid samples; `player` and `shared`
+    // are installed by the thread that owns them, for the duration of the call.
     let samples = if count > 0 {
         unsafe { std::slice::from_raw_parts(wav, count as usize) }
     } else {
         &[]
     };
-    let player = unsafe { &mut *player };
-    if player.on_chunk(samples) {
+    let player = unsafe { &mut *ctx.player };
+    let shared = unsafe { &*ctx.shared };
+    if player.on_chunk(samples, &|| shared.cancelled()) {
         0
     } else {
         1
     }
 }
 
-/// Plays the PCM of one utterance at a time.
-struct Player {
+/// Plays the PCM of one utterance at a time over PulseAudio, with WSLg
+/// pause-gapping, backlog control and 2x upsampling. Shared with the
+/// multi-engine backend (`alsa.rs`) so all engines work cleanly on WSL2.
+pub(crate) struct PulsePlayer {
     pulse: Arc<Pulse>,
-    shared: Arc<Shared>,
     stream: Option<Stream>,
     upsampler: Upsampler,
-    /// Rate of the samples espeak-ng delivers
+    /// Rate of the samples the synthesiser delivers
     in_rate: u32,
     /// Silence (in input samples) seen since the last sound
     pending_silence: usize,
@@ -963,22 +990,59 @@ struct Player {
     current_is_letter: bool,
 }
 
-impl Player {
-    fn cancelled(&self) -> bool {
-        self.shared.cancel.load(Ordering::SeqCst) || self.shared.shutdown.load(Ordering::SeqCst)
+impl PulsePlayer {
+    pub(crate) fn new(pulse: Arc<Pulse>, in_rate: u32) -> Self {
+        Self {
+            pulse,
+            stream: None,
+            upsampler: Upsampler::new(),
+            in_rate: in_rate.max(1),
+            pending_silence: 0,
+            sent_since_check_ms: 0,
+            last_warning: None,
+            wsl: is_wsl(),
+            current_is_letter: false,
+        }
+    }
+
+    /// Update the input sample rate (reopening the stream on next write if it
+    /// changed, e.g. when switching voices or engines).
+    pub(crate) fn set_rate(&mut self, rate: u32) {
+        let rate = rate.max(1);
+        if rate != self.in_rate {
+            self.in_rate = rate;
+            self.abort();
+        }
+    }
+
+    pub(crate) fn set_letter(&mut self, is_letter: bool) {
+        self.current_is_letter = is_letter;
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    /// How long an open stream may sit idle before `close_idle` closes it.
+    pub(crate) fn idle_timeout(&self) -> Duration {
+        if self.wsl {
+            WSL_LETTER_IDLE_CLOSE
+        } else {
+            IDLE_CLOSE
+        }
     }
 
     /// Sleep up to `ms`, stopping early on cancel. Returns false if cancelled.
-    fn wait(&self, ms: u64) -> bool {
+    fn wait(&self, ms: u64, cancelled: &dyn Fn() -> bool) -> bool {
         let end = Instant::now() + Duration::from_millis(ms);
         while Instant::now() < end {
-            if self.cancelled() {
+            if cancelled() {
                 return false;
             }
             let left = end.saturating_duration_since(Instant::now());
             thread::sleep(left.min(SLEEP_STEP));
         }
-        !self.cancelled()
+        !cancelled()
     }
 
     fn warn(&mut self, msg: &str) {
@@ -993,46 +1057,60 @@ impl Player {
         }
     }
 
-    /// One chunk from espeak-ng. Returns false to stop synthesis.
-    fn on_chunk(&mut self, samples: &[i16]) -> bool {
-        if self.cancelled() {
+    /// One chunk of PCM from any synthesiser. Returns false to stop synthesis.
+    /// Chunks longer than ~20 ms are sliced so pause detection and cancel
+    /// responsiveness stay uniform across engines.
+    pub(crate) fn on_chunk(&mut self, samples: &[i16], cancelled: &dyn Fn() -> bool) -> bool {
+        if cancelled() {
             return false;
         }
         if samples.is_empty() {
             return true;
         }
-        let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-        if peak <= SILENCE_PEAK {
-            self.pending_silence += samples.len();
-            return true;
+        let max_slice = (self.in_rate as usize / 50).max(1);
+        for slice in samples.chunks(max_slice) {
+            if cancelled() {
+                return false;
+            }
+            let peak = slice.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+            if peak <= SILENCE_PEAK {
+                self.pending_silence += slice.len();
+                continue;
+            }
+            if !(self.flush_silence(false, cancelled)
+                && self.check_backlog(cancelled)
+                && self.write(slice))
+            {
+                return false;
+            }
         }
-        self.flush_silence(false) && self.check_backlog() && self.write(samples)
+        true
     }
 
     /// Deliver the silence seen so far. On WSL a real pause (or the end of
     /// the utterance) becomes a closed-stream gap so nothing is sent while
     /// nothing sounds; short silences, and all silence on native Linux, are
-    /// written as samples so the cadence is exactly espeak-ng's.
-    fn flush_silence(&mut self, end: bool) -> bool {
+    /// written as samples so the cadence is unchanged.
+    fn flush_silence(&mut self, end: bool, cancelled: &dyn Fn() -> bool) -> bool {
         let n = std::mem::take(&mut self.pending_silence);
         if n == 0 {
             return true;
         }
         let ms = (n as u64 * 1000 / self.in_rate as u64) as u32;
         if self.wsl && (end || ms >= GAP_MIN_MS) {
-            self.gap(ms as u64)
+            self.gap(ms as u64, cancelled)
         } else {
-            self.write_silence(n)
+            self.write_silence(n, cancelled)
         }
     }
 
     /// Write `n` silent samples in 20 ms slices, stopping on cancel.
-    fn write_silence(&mut self, n: usize) -> bool {
+    fn write_silence(&mut self, n: usize, cancelled: &dyn Fn() -> bool) -> bool {
         let slice = (self.in_rate as usize / 50).max(1);
         let zeros = vec![0i16; slice];
         let mut left = n;
         while left > 0 {
-            if self.cancelled() {
+            if cancelled() {
                 return false;
             }
             let take = left.min(slice);
@@ -1069,7 +1147,7 @@ impl Player {
     }
 
     /// On WSL, insert a gap when the client's backlog has grown too far.
-    fn check_backlog(&mut self) -> bool {
+    fn check_backlog(&mut self, cancelled: &dyn Fn() -> bool) -> bool {
         if !self.wsl || self.sent_since_check_ms < BACKLOG_CHECK_MS {
             return true;
         }
@@ -1079,7 +1157,7 @@ impl Player {
         };
         if latency > BACKLOG_LIMIT_MS {
             debug!("Audio backlog {} ms; draining", latency);
-            return self.gap(latency - BACKLOG_TARGET_MS);
+            return self.gap(latency - BACKLOG_TARGET_MS, cancelled);
         }
         true
     }
@@ -1103,10 +1181,10 @@ impl Player {
 
     /// Let the buffered sound finish, then close the stream. Returns false
     /// if cancelled meanwhile (the stream is then flushed by `abort`).
-    fn close_after_playout(&mut self) -> bool {
+    fn close_after_playout(&mut self, cancelled: &dyn Fn() -> bool) -> bool {
         if self.stream.is_some() {
             let delay = self.close_delay_ms();
-            if !self.wait(delay) {
+            if !self.wait(delay, cancelled) {
                 return false;
             }
             self.stream = None;
@@ -1118,8 +1196,8 @@ impl Player {
     /// A pause of `ms` (WSL): let the buffered sound finish, close the
     /// stream, and only then wait out the pause, so the pause is heard in
     /// full after the sound. Returns false if cancelled meanwhile.
-    fn gap(&mut self, ms: u64) -> bool {
-        self.close_after_playout() && self.wait(ms)
+    fn gap(&mut self, ms: u64, cancelled: &dyn Fn() -> bool) -> bool {
+        self.close_after_playout(cancelled) && self.wait(ms, cancelled)
     }
 
     /// After an utterance completed: play out its trailing pause. On WSL
@@ -1131,25 +1209,25 @@ impl Player {
     /// stream is left open (the loop closes it after a short idle), so the
     /// letters of someone typing run straight into each other instead of
     /// each waiting for a play-out, a close and a fresh stream.
-    fn finish(&mut self) {
+    pub(crate) fn finish(&mut self, cancelled: &dyn Fn() -> bool) {
         if self.current_is_letter {
             self.pending_silence = 0;
             return;
         }
-        if !self.flush_silence(true) {
+        if !self.flush_silence(true, cancelled) {
             self.abort();
             return;
         }
-        if self.wsl && !self.close_after_playout() {
+        if self.wsl && !self.close_after_playout(cancelled) {
             self.abort();
             return;
         }
         self.sent_since_check_ms = 0;
     }
 
-    /// Close a stream that has been idle (native Linux). Everything in it
-    /// has played by now, so nothing is lost.
-    fn close_idle(&mut self) {
+    /// Close a stream that has been idle. Everything in it has played by now,
+    /// so nothing is lost.
+    pub(crate) fn close_idle(&mut self) {
         if self.stream.take().is_some() {
             debug!("Playback stream closed after idle");
         }
@@ -1157,7 +1235,7 @@ impl Player {
     }
 
     /// Drop everything not yet played.
-    fn abort(&mut self) {
+    pub(crate) fn abort(&mut self) {
         self.pending_silence = 0;
         self.sent_since_check_ms = 0;
         if let Some(s) = self.stream.take() {
@@ -1169,7 +1247,7 @@ impl Player {
     /// at once. A letter's buffered tail (at most the 40 ms the server
     /// holds) is left to play: cutting it clicks on every keystroke, and
     /// the next letter simply follows it in the same stream.
-    fn stop_current(&mut self) {
+    pub(crate) fn stop_current(&mut self) {
         if self.current_is_letter {
             self.pending_silence = 0;
         } else {
@@ -1204,24 +1282,13 @@ fn audio_thread(shared: Arc<Shared>, ready: mpsc::Sender<InitResult>) {
     }
     let _ = ready.send(Ok((Arc::clone(&pulse), espeak.voices())));
 
-    let mut player = Player {
-        pulse,
-        shared: Arc::clone(&shared),
-        stream: None,
-        upsampler: Upsampler::new(),
-        in_rate: espeak.sample_rate,
-        pending_silence: 0,
-        sent_since_check_ms: 0,
-        last_warning: None,
-        wsl: is_wsl(),
-        current_is_letter: false,
-    };
+    let mut player = PulsePlayer::new(pulse, espeak.sample_rate);
 
     // The voice espeak-ng currently has loaded (its default until told
     // otherwise).
     let mut applied_voice = DEFAULT_VOICE.to_string();
     espeak.set_voice(&applied_voice);
-    player.in_rate = espeak.sample_rate;
+    player.set_rate(espeak.sample_rate);
     shared
         .sample_rate
         .store(espeak.sample_rate, Ordering::SeqCst);
@@ -1247,17 +1314,12 @@ fn audio_thread(shared: Arc<Shared>, ready: mpsc::Sender<InitResult>) {
                     shared.cancel.store(false, Ordering::SeqCst);
                     break Job::Speak(utterance, settings);
                 }
-                if player.stream.is_some() {
+                if player.is_open() {
                     // A stream left open after the last utterance (always on
                     // native Linux; after a typed letter on WSL)
-                    let idle = if player.wsl {
-                        WSL_LETTER_IDLE_CLOSE
-                    } else {
-                        IDLE_CLOSE
-                    };
                     let (guard, timeout) = shared
                         .wake
-                        .wait_timeout(q, idle)
+                        .wait_timeout(q, player.idle_timeout())
                         .unwrap_or_else(|e| e.into_inner());
 
                     q = guard;
@@ -1273,7 +1335,6 @@ fn audio_thread(shared: Arc<Shared>, ready: mpsc::Sender<InitResult>) {
         match job {
             Job::Idle => player.close_idle(),
             Job::Voice(req) => {
-                let old_rate = espeak.sample_rate;
                 let ok = espeak.set_voice(&req.id);
                 if ok {
                     applied_voice = req.id.clone();
@@ -1282,14 +1343,10 @@ fn audio_thread(shared: Arc<Shared>, ready: mpsc::Sender<InitResult>) {
                     // back so speech keeps working.
                     espeak.set_voice(&applied_voice);
                 }
-                player.in_rate = espeak.sample_rate;
+                player.set_rate(espeak.sample_rate);
                 shared
                     .sample_rate
                     .store(espeak.sample_rate, Ordering::SeqCst);
-                if espeak.sample_rate != old_rate {
-                    // An open stream has the old rate
-                    player.abort();
-                }
                 let _ = req.reply.send(if ok {
                     Ok(espeak.sample_rate)
                 } else {
@@ -1301,15 +1358,19 @@ fn audio_thread(shared: Arc<Shared>, ready: mpsc::Sender<InitResult>) {
                     espeak.set_rate(wpm_for_rate(s.rate));
                     espeak.set_volume(s.volume);
                 }
-                player.current_is_letter = utterance.is_letter;
-                PLAYER.with(|p| p.set(&mut player as *mut Player));
+                player.set_letter(utterance.is_letter);
+                let ctx = CallbackCtx {
+                    player: &mut player as *mut PulsePlayer,
+                    shared: Arc::as_ptr(&shared),
+                };
+                PLAYER.with(|p| p.set(Some(ctx)));
                 espeak.synth(&utterance.text, !utterance.is_letter);
-                PLAYER.with(|p| p.set(ptr::null_mut()));
+                PLAYER.with(|p| p.set(None));
 
-                if player.cancelled() {
+                if shared.cancelled() {
                     player.stop_current();
                 } else {
-                    player.finish();
+                    player.finish(&|| shared.cancelled());
                 }
             }
         }
@@ -1317,7 +1378,7 @@ fn audio_thread(shared: Arc<Shared>, ready: mpsc::Sender<InitResult>) {
 }
 
 /// Holds a recording of the sink's monitor so WSLg's sink never suspends.
-fn keepalive_thread(pulse: Arc<Pulse>, shared: Arc<Shared>) {
+fn keepalive_thread(pulse: Arc<Pulse>, shutdown: Arc<AtomicBool>) {
     let stream = match pulse.open_monitor(OUTPUT_RATE) {
         Ok(s) => s,
         Err(e) => {
@@ -1330,7 +1391,7 @@ fn keepalive_thread(pulse: Arc<Pulse>, shared: Arc<Shared>) {
     };
     debug!("Sink keep-alive recording open");
     let mut buf = vec![0u8; (OUTPUT_RATE * 2 / 10) as usize];
-    while !shared.shutdown.load(Ordering::SeqCst) {
+    while !shutdown.load(Ordering::SeqCst) {
         if let Err(e) = stream.read(&mut buf) {
             warn!("Sink keep-alive stopped: {}", e);
             return;
@@ -1344,6 +1405,7 @@ fn keepalive_thread(pulse: Arc<Pulse>, shared: Arc<Shared>) {
 pub struct EspeakSynth {
     shared: Arc<Shared>,
     voices: VoiceCatalogue,
+    current_voice: String,
     audio_thread: Option<thread::JoinHandle<()>>,
     /// The server connection the audio thread plays through (read by the
     /// measurement tests)
@@ -1385,7 +1447,7 @@ impl EspeakSynth {
             }),
             wake: Condvar::new(),
             cancel: AtomicBool::new(false),
-            shutdown: AtomicBool::new(false),
+            shutdown: Arc::new(AtomicBool::new(false)),
             sample_rate: AtomicU32::new(0),
         });
 
@@ -1407,16 +1469,7 @@ impl EspeakSynth {
             }
         };
 
-        if is_wsl() {
-            let ka_shared = Arc::clone(&shared);
-            let ka_pulse = Arc::clone(&pulse);
-            if let Err(e) = thread::Builder::new()
-                .name("tdsr-keepalive".to_string())
-                .spawn(move || keepalive_thread(ka_pulse, ka_shared))
-            {
-                warn!("Could not start sink keep-alive thread: {}", e);
-            }
-        }
+        pulse.spawn_keepalive(Arc::clone(&shared.shutdown));
 
         info!(
             "espeak-ng in-process backend ready ({} voices)",
@@ -1425,6 +1478,7 @@ impl EspeakSynth {
         Ok(Self {
             shared,
             voices,
+            current_voice: DEFAULT_VOICE.to_string(),
             audio_thread: Some(audio_thread),
             pulse,
         })
@@ -1532,7 +1586,35 @@ impl Synth for EspeakSynth {
         debug!("Setting voice to {}", ident);
         let rate = self.apply_voice(&ident)?;
         debug!("Voice {} loaded, {} Hz", ident, rate);
+        self.current_voice = ident;
         Ok(name)
+    }
+
+    fn next_voice(&mut self) -> Result<(String, String)> {
+        let installed: Vec<String> = self
+            .voices
+            .iter()
+            .filter(|(_, v)| v.installed)
+            .map(|(_, v)| v.identifier.clone())
+            .collect();
+        if installed.len() <= 1 {
+            return Err(TdsrError::Speech(
+                "only one e speak voice is installed".to_string(),
+            ));
+        }
+        let current_ident = self
+            .voices
+            .find(&self.current_voice)
+            .map(|v| v.identifier.as_str())
+            .unwrap_or(self.current_voice.as_str());
+        let next_idx = installed
+            .iter()
+            .position(|id| id == current_ident)
+            .map(|i| (i + 1) % installed.len())
+            .unwrap_or(0);
+        let next_id = installed[next_idx].clone();
+        let spoken = self.set_voice(&next_id)?;
+        Ok((next_id, spoken))
     }
 
     fn voice_count(&self) -> Option<usize> {

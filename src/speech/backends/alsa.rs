@@ -32,13 +32,16 @@
 //! Everything talks to the engines and the device from one audio thread; the
 //! `Synth` methods only push onto a queue.
 
-use crate::speech::backends::espeak::{chunk_callback, Espeak};
+use crate::platform::is_wsl;
+use crate::speech::backends::espeak::{
+    chunk_callback, Espeak, Pulse, PulsePlayer, OUTPUT_RATE as PULSE_OUTPUT_RATE,
+};
 #[cfg(feature = "piper")]
 use crate::speech::backends::piper;
-use crate::speech::backends::pulseaudio::wpm_for_rate;
+use crate::speech::backends::pulseaudio::{setup_pulseaudio, wpm_for_rate};
 use crate::speech::backends::{pico, rhvoice};
 use crate::speech::resample::Upsampler;
-use crate::speech::voices::VoiceCatalogue;
+use crate::speech::voices::{legacy_voice_name, VoiceCatalogue};
 use crate::speech::{SpeechCommand, Synth};
 use crate::{Result, TdsrError};
 use libloading::Library;
@@ -46,6 +49,7 @@ use log::{debug, info, warn};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void, CStr, CString};
+use std::fmt::Write as _;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -238,6 +242,8 @@ pub(crate) trait Engine {
     fn set_volume(&mut self, volume: u8);
     /// Select a voice; returns its spoken name.
     fn set_voice(&mut self, id: &str) -> std::result::Result<String, String>;
+    /// Step to this engine's next voice, returning `(persistent_id, spoken_name)`.
+    fn next_voice(&mut self) -> std::result::Result<(String, String), String>;
     /// Synthesise `text`, handing PCM to `sink` until it is done or `sink`
     /// returns false (a cancel). `sink(&[])` writes nothing and only answers
     /// whether the utterance is still wanted.
@@ -310,6 +316,30 @@ impl Engine for EspeakEngine {
         }
     }
 
+    fn next_voice(&mut self) -> std::result::Result<(String, String), String> {
+        let native: Vec<String> = self
+            .voices
+            .iter()
+            .filter(|(_, v)| !v.is_mbrola() && v.installed)
+            .map(|(_, v)| v.identifier.clone())
+            .collect();
+        if native.len() <= 1 {
+            return Err("only one e speak voice is installed".to_string());
+        }
+        let current = self.lib.borrow().selected_voice();
+        let current_ident = current
+            .as_deref()
+            .and_then(|c| self.voices.find(c).map(|v| v.identifier.as_str()))
+            .or(current.as_deref());
+        let next_idx = current_ident
+            .and_then(|cur| native.iter().position(|id| id == cur))
+            .map(|i| (i + 1) % native.len())
+            .unwrap_or(0);
+        let next_id = native[next_idx].clone();
+        let spoken = self.set_voice(&next_id)?;
+        Ok((next_id, spoken))
+    }
+
     fn synth(&mut self, text: &str, is_letter: bool, sink: &mut dyn FnMut(&[i16]) -> bool) {
         self.lib
             .borrow_mut()
@@ -346,6 +376,36 @@ struct MbrolaEngine {
     amplitude: u8,
 }
 
+/// Installed MBROLA voices discovered from an espeak-ng catalogue, sorted by
+/// database name and deduplicated. Shared between `MbrolaEngine` and
+/// `list_voices` so voice indices match.
+fn collect_mbrola_voices(catalogue: &VoiceCatalogue) -> Vec<MbrolaVoice> {
+    let mut voices: Vec<MbrolaVoice> = Vec::new();
+    for (_, v) in catalogue.iter() {
+        if !v.is_mbrola() || !v.installed {
+            continue;
+        }
+        let Some(db) = v.mbrola_database() else {
+            continue;
+        };
+        if voices.iter().any(|m| m.database == db) {
+            continue;
+        }
+        let gender = match v.gender {
+            crate::speech::voices::Gender::Female => ", female",
+            crate::speech::voices::Gender::Male => ", male",
+            crate::speech::voices::Gender::Unknown => "",
+        };
+        voices.push(MbrolaVoice {
+            identifier: v.identifier.clone(),
+            database: db.to_string(),
+            spoken: format!("{}{}", db, gender),
+        });
+    }
+    voices.sort_by(|a, b| a.database.cmp(&b.database));
+    voices
+}
+
 impl MbrolaEngine {
     /// None when no MBROLA voice is installed.
     fn new(
@@ -353,33 +413,11 @@ impl MbrolaEngine {
         catalogue: &VoiceCatalogue,
         opts: &AlsaOptions,
     ) -> Option<Self> {
-        let mut voices: Vec<MbrolaVoice> = Vec::new();
-        for (_, v) in catalogue.iter() {
-            if !v.is_mbrola() || !v.installed {
-                continue;
-            }
-            let Some(db) = v.mbrola_database() else {
-                continue;
-            };
-            if voices.iter().any(|m| m.database == db) {
-                continue;
-            }
-            let gender = match v.gender {
-                crate::speech::voices::Gender::Female => ", female",
-                crate::speech::voices::Gender::Male => ", male",
-                crate::speech::voices::Gender::Unknown => "",
-            };
-            voices.push(MbrolaVoice {
-                identifier: v.identifier.clone(),
-                database: db.to_string(),
-                spoken: format!("{}{}", db, gender),
-            });
-        }
+        let voices = collect_mbrola_voices(catalogue);
         if voices.is_empty() {
             info!("MBROLA not loaded: no MBROLA voice is installed");
             return None;
         }
-        voices.sort_by(|a, b| a.database.cmp(&b.database));
         let mut engine = Self {
             lib,
             current: voices.iter().position(|v| v.database == "us1").unwrap_or(0),
@@ -441,6 +479,16 @@ impl Engine for MbrolaEngine {
         self.current = i;
         self.sample_rate = rate;
         Ok(format!("M brola {}", self.voices[i].spoken))
+    }
+
+    fn next_voice(&mut self) -> std::result::Result<(String, String), String> {
+        if self.voices.len() <= 1 {
+            return Err("only one M brola voice is installed".to_string());
+        }
+        let next = (self.current + 1) % self.voices.len();
+        let db = self.voices[next].database.clone();
+        let spoken = self.set_voice(&db)?;
+        Ok((format!("{}{}", MBROLA_VOICE_PREFIX, db), spoken))
     }
 
     fn synth(&mut self, text: &str, is_letter: bool, sink: &mut dyn FnMut(&[i16]) -> bool) {
@@ -586,6 +634,16 @@ impl Engine for PiperEngine {
             self.failed = None;
         }
         Ok(piper_spoken_name(&self.voices[i].name))
+    }
+
+    fn next_voice(&mut self) -> std::result::Result<(String, String), String> {
+        if self.voices.len() <= 1 {
+            return Err("only one Piper voice is installed".to_string());
+        }
+        let next = (self.current + 1) % self.voices.len();
+        let name = self.voices[next].name.clone();
+        let spoken = self.set_voice(&name)?;
+        Ok((format!("{}{}", PIPER_VOICE_PREFIX, name), spoken))
     }
 
     fn synth(&mut self, text: &str, is_letter: bool, sink: &mut dyn FnMut(&[i16]) -> bool) {
@@ -887,6 +945,19 @@ mod dectalk {
             }
         }
 
+        fn next_voice(&mut self) -> std::result::Result<(String, String), String> {
+            let cur = DECTALK_VOICES
+                .iter()
+                .position(|(_, cmd, _)| *cmd == self.voice_cmd)
+                .unwrap_or(0);
+            let (name, cmd, spoken) = DECTALK_VOICES[(cur + 1) % DECTALK_VOICES.len()];
+            self.voice_cmd = cmd;
+            Ok((
+                format!("{}{}", DECTALK_VOICE_PREFIX, name),
+                spoken.to_string(),
+            ))
+        }
+
         fn synth(&mut self, text: &str, is_letter: bool, sink: &mut dyn FnMut(&[i16]) -> bool) {
             let gain = self.volume as i32;
             let mut scaled: Vec<i16> = Vec::with_capacity(BLOCK);
@@ -1168,12 +1239,15 @@ struct Utterance {
 }
 
 type Reply = mpsc::Sender<std::result::Result<String, String>>;
+type VoiceReply = mpsc::Sender<std::result::Result<(String, String), String>>;
 
 enum Control {
     /// Rate of this engine (the one current when it was set)
     Rate(EngineKind, u8),
     Volume(u8),
     Voice(String, Reply),
+    /// Step to the next voice of the current engine
+    NextVoice(VoiceReply),
     /// Switch to this engine
     Engine(EngineKind, Reply),
 }
@@ -1189,13 +1263,51 @@ struct Shared {
     /// Bumped by every cancel; an utterance stops when it no longer matches
     /// the value seen when it was dequeued.
     epoch: AtomicU64,
-    shutdown: AtomicBool,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, Queue> {
         self.queue.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// Which audio output path the multi-engine backend plays through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputMode {
+    /// Direct ALSA (`libasound.so.2`). On WSL with the default ALSA device,
+    /// prefers WSLg-managed PulseAudio so all engines get keep-alive,
+    /// pause-gapping, backlog control and 2x upsampling.
+    Alsa,
+    /// TDSR-managed PulseAudio (`libpulse-simple.so.0`).
+    Pulse,
+}
+
+/// Direct ALSA output state held by the audio thread.
+struct AlsaOutput {
+    alsa: Arc<Alsa>,
+    device: String,
+    buffer_ms: u32,
+    pcm: Option<Pcm>,
+    /// Audio has been written since the last drain
+    undrained: bool,
+}
+
+impl AlsaOutput {
+    fn pcm(&mut self, rate: u32) -> Result<&Pcm> {
+        if self.pcm.as_ref().map(|p| p.rate) != Some(rate) {
+            self.pcm = None;
+            self.pcm = Some(Pcm::open(&self.alsa, &self.device, rate, self.buffer_ms)?);
+            self.undrained = false;
+        }
+        Ok(self.pcm.as_ref().expect("opened above"))
+    }
+}
+
+/// Active audio sink on the audio thread.
+enum AudioOutput {
+    Alsa(AlsaOutput),
+    Pulse(PulsePlayer),
 }
 
 /// What the constructor learns from the audio thread.
@@ -1207,21 +1319,23 @@ struct Ready {
     other_voices: Vec<String>,
     engines: Vec<EngineKind>,
     current: EngineKind,
+    /// Set when playing through PulseAudio so the constructor can spawn the
+    /// WSL sink keep-alive thread.
+    pulse: Option<Arc<Pulse>>,
 }
 
 enum Job {
     Control(Control),
     Speak(Utterance, u64),
     Drain,
+    CloseIdle,
     Wait,
 }
 
 /// The audio thread's state.
 struct Worker {
     shared: Arc<Shared>,
-    alsa: Arc<Alsa>,
-    device: String,
-    buffer_ms: u32,
+    output: Option<AudioOutput>,
     espeak: Option<EspeakEngine>,
     mbrola: Option<MbrolaEngine>,
     #[cfg(feature = "dectalk")]
@@ -1231,9 +1345,6 @@ struct Worker {
     rhvoice: Option<rhvoice::RhvoiceEngine>,
     pico: Option<pico::PicoEngine>,
     current: EngineKind,
-    pcm: Option<Pcm>,
-    /// Audio has been written since the last drain
-    undrained: bool,
 }
 
 impl Worker {
@@ -1279,18 +1390,23 @@ impl Worker {
         v
     }
 
-    /// The stream for the current engine's rate, (re)opened as needed.
-    fn pcm(&mut self) -> Result<&Pcm> {
-        let rate = self
-            .engine(self.current)
+    fn current_rate(&mut self) -> u32 {
+        self.engine(self.current)
             .map(|e| e.sample_rate())
-            .unwrap_or(22050);
-        if self.pcm.as_ref().map(|p| p.rate) != Some(rate) {
-            self.pcm = None;
-            self.pcm = Some(Pcm::open(&self.alsa, &self.device, rate, self.buffer_ms)?);
-            self.undrained = false;
+            .unwrap_or(22050)
+    }
+
+    /// Prove the audio output can open for the current engine's rate.
+    fn open_initial(&mut self) -> Result<()> {
+        let rate = self.current_rate();
+        match self.output.as_mut() {
+            Some(AudioOutput::Alsa(a)) => a.pcm(rate).map(|_| ()),
+            Some(AudioOutput::Pulse(p)) => {
+                p.set_rate(rate);
+                Ok(())
+            }
+            None => Ok(()),
         }
-        Ok(self.pcm.as_ref().expect("opened above"))
     }
 
     fn next_job(&self) -> Job {
@@ -1305,10 +1421,23 @@ impl Worker {
             if let Some(u) = q.items.pop_front() {
                 return Job::Speak(u, self.shared.epoch.load(Ordering::SeqCst));
             }
-            if self.undrained {
-                return Job::Drain;
+            match self.output.as_ref() {
+                Some(AudioOutput::Alsa(a)) if a.undrained => return Job::Drain,
+                Some(AudioOutput::Pulse(p)) if p.is_open() => {
+                    let (guard, timeout) = self
+                        .shared
+                        .wake
+                        .wait_timeout(q, p.idle_timeout())
+                        .unwrap_or_else(|e| e.into_inner());
+                    q = guard;
+                    if timeout.timed_out() && q.items.is_empty() && q.controls.is_empty() {
+                        return Job::CloseIdle;
+                    }
+                }
+                _ => {
+                    q = self.shared.wake.wait(q).unwrap_or_else(|e| e.into_inner());
+                }
             }
-            q = self.shared.wake.wait(q).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -1317,10 +1446,17 @@ impl Worker {
             match self.next_job() {
                 Job::Wait => {}
                 Job::Drain => {
-                    if let Some(p) = &self.pcm {
-                        p.drain();
+                    if let Some(AudioOutput::Alsa(a)) = self.output.as_mut() {
+                        if let Some(p) = &a.pcm {
+                            p.drain();
+                        }
+                        a.undrained = false;
                     }
-                    self.undrained = false;
+                }
+                Job::CloseIdle => {
+                    if let Some(AudioOutput::Pulse(p)) = self.output.as_mut() {
+                        p.close_idle();
+                    }
                 }
                 Job::Control(c) => self.control(c),
                 Job::Speak(u, epoch) => self.speak(u, epoch),
@@ -1350,16 +1486,45 @@ impl Worker {
                 };
                 let _ = reply.send(result);
             }
+            Control::NextVoice(reply) => {
+                let current = self.current;
+                let result = match self.engine(current) {
+                    Some(e) => {
+                        let res = e.next_voice();
+                        if res.is_ok() {
+                            match self.output.as_mut() {
+                                Some(AudioOutput::Alsa(a)) => {
+                                    if let Some(p) = &a.pcm {
+                                        p.drop_queued();
+                                    }
+                                    a.undrained = false;
+                                }
+                                Some(AudioOutput::Pulse(p)) => p.abort(),
+                                None => {}
+                            }
+                        }
+                        res
+                    }
+                    None => Err(format!("{} is not loaded", current.spoken())),
+                };
+                let _ = reply.send(result);
+            }
             Control::Engine(k, reply) => {
                 let result = if self.engine(k).is_some() {
                     if k != self.current {
                         self.current = k;
                         // Interrupt what is playing: the announcement that
                         // follows comes from the new engine.
-                        if let Some(p) = &self.pcm {
-                            p.drop_queued();
+                        match self.output.as_mut() {
+                            Some(AudioOutput::Alsa(a)) => {
+                                if let Some(p) = &a.pcm {
+                                    p.drop_queued();
+                                }
+                                a.undrained = false;
+                            }
+                            Some(AudioOutput::Pulse(p)) => p.abort(),
+                            None => {}
                         }
-                        self.undrained = false;
                     }
                     Ok(k.spoken().to_string())
                 } else {
@@ -1372,29 +1537,52 @@ impl Worker {
 
     fn speak(&mut self, u: Utterance, epoch: u64) {
         let shared = Arc::clone(&self.shared);
-        if let Err(e) = self.pcm() {
-            warn!("{}", e);
-            return;
-        }
+        let rate = self.current_rate();
         // Out of `self` while the engine (also borrowed from `self`) runs.
-        let Some(pcm) = self.pcm.take() else { return };
+        let Some(mut output) = self.output.take() else {
+            return;
+        };
+        match &mut output {
+            AudioOutput::Alsa(a) => {
+                if let Err(e) = a.pcm(rate) {
+                    warn!("{}", e);
+                    self.output = Some(output);
+                    return;
+                }
+            }
+            AudioOutput::Pulse(p) => {
+                p.set_rate(rate);
+                p.set_letter(u.is_letter);
+            }
+        }
+        let is_cancelled = || {
+            shared.epoch.load(Ordering::SeqCst) != epoch || shared.shutdown.load(Ordering::SeqCst)
+        };
         let mut failed = false;
         let mut written = 0usize;
         let mut sink = |samples: &[i16]| -> bool {
-            if shared.epoch.load(Ordering::SeqCst) != epoch
-                || shared.shutdown.load(Ordering::SeqCst)
-            {
+            if is_cancelled() {
                 return false;
+            }
+            if samples.is_empty() {
+                return true;
             }
             written += samples.len();
-            if let Err(e) = pcm.write(samples) {
-                if !failed {
-                    warn!("{}", e);
-                    failed = true;
+            match &mut output {
+                AudioOutput::Alsa(a) => {
+                    if let Some(pcm) = &a.pcm {
+                        if let Err(e) = pcm.write(samples) {
+                            if !failed {
+                                warn!("{}", e);
+                                failed = true;
+                            }
+                            return false;
+                        }
+                    }
+                    true
                 }
-                return false;
+                AudioOutput::Pulse(p) => p.on_chunk(samples, &is_cancelled),
             }
-            true
         };
         let current = self.current;
         if let Some(engine) = self.engine(current) {
@@ -1403,26 +1591,108 @@ impl Worker {
         debug!(
             "{:?}: {} ms of audio at {} Hz",
             current,
-            written as u64 * 1000 / pcm.rate.max(1) as u64,
-            pcm.rate
+            written as u64 * 1000 / rate.max(1) as u64,
+            rate
         );
-        let cancelled = shared.epoch.load(Ordering::SeqCst) != epoch;
-        if cancelled {
-            pcm.drop_queued();
-            self.undrained = false;
-        } else {
-            self.undrained = true;
+        let cancelled = is_cancelled();
+        match &mut output {
+            AudioOutput::Alsa(a) => {
+                if cancelled {
+                    if let Some(pcm) = &a.pcm {
+                        pcm.drop_queued();
+                    }
+                    a.undrained = false;
+                } else {
+                    a.undrained = true;
+                }
+            }
+            AudioOutput::Pulse(p) => {
+                if cancelled {
+                    p.stop_current();
+                } else {
+                    p.finish(&is_cancelled);
+                }
+            }
         }
-        self.pcm = Some(pcm);
+        self.output = Some(output);
     }
 }
 
-fn audio_thread(shared: Arc<Shared>, opts: AlsaOptions, ready: mpsc::Sender<Result<Ready>>) {
-    let alsa = match Alsa::load() {
-        Ok(a) => Arc::new(a),
-        Err(e) => {
-            let _ = ready.send(Err(e));
-            return;
+/// Try opening a PulseAudio connection and verify the server responds.
+fn open_pulse() -> Result<Arc<Pulse>> {
+    setup_pulseaudio()?;
+    let pulse = Pulse::load()?;
+    // Prove the server is reachable before reporting success
+    pulse.open_playback(PULSE_OUTPUT_RATE)?;
+    Ok(pulse)
+}
+
+fn audio_thread(
+    shared: Arc<Shared>,
+    opts: AlsaOptions,
+    mode: OutputMode,
+    ready: mpsc::Sender<Result<Ready>>,
+) {
+    let (output, pulse_for_keepalive) = match mode {
+        OutputMode::Pulse => match open_pulse() {
+            Ok(pulse) => (
+                AudioOutput::Pulse(PulsePlayer::new(Arc::clone(&pulse), 22050)),
+                Some(pulse),
+            ),
+            Err(e) => {
+                let _ = ready.send(Err(e));
+                return;
+            }
+        },
+        OutputMode::Alsa => {
+            // On WSL with the default ALSA device, route through TDSR's
+            // WSLg-managed PulseAudio player so all engines avoid WSLg RDP
+            // backlog drift, post-suspend lag and low-quality resampling.
+            let pulse_first = if is_wsl() && opts.device.trim().eq_ignore_ascii_case("default") {
+                match open_pulse() {
+                    Ok(pulse) => {
+                        info!("WSL with default ALSA device: using WSL-managed PulseAudio output");
+                        Some(pulse)
+                    }
+                    Err(e) => {
+                        info!(
+                            "WSL PulseAudio output unavailable ({}); falling back to ALSA",
+                            e
+                        );
+                        None
+                    }
+                }
+            } else {
+                // Best-effort auto-detect of /mnt/wslg/PulseServer when using
+                // libasound's pulse plugin explicitly on WSL.
+                if is_wsl() {
+                    let _ = setup_pulseaudio();
+                }
+                None
+            };
+            if let Some(pulse) = pulse_first {
+                (
+                    AudioOutput::Pulse(PulsePlayer::new(Arc::clone(&pulse), 22050)),
+                    Some(pulse),
+                )
+            } else {
+                match Alsa::load() {
+                    Ok(alsa) => (
+                        AudioOutput::Alsa(AlsaOutput {
+                            alsa: Arc::new(alsa),
+                            device: opts.device.clone(),
+                            buffer_ms: opts.buffer_ms,
+                            pcm: None,
+                            undrained: false,
+                        }),
+                        None,
+                    ),
+                    Err(e) => {
+                        let _ = ready.send(Err(e));
+                        return;
+                    }
+                }
+            }
         }
     };
     let espeak = match EspeakEngine::load() {
@@ -1491,9 +1761,7 @@ fn audio_thread(shared: Arc<Shared>, opts: AlsaOptions, ready: mpsc::Sender<Resu
     }
     let mut worker = Worker {
         shared,
-        alsa,
-        device: opts.device.clone(),
-        buffer_ms: opts.buffer_ms,
+        output: Some(output),
         espeak,
         mbrola,
         #[cfg(feature = "dectalk")]
@@ -1503,8 +1771,6 @@ fn audio_thread(shared: Arc<Shared>, opts: AlsaOptions, ready: mpsc::Sender<Resu
         rhvoice,
         pico,
         current: EngineKind::Espeak,
-        pcm: None,
-        undrained: false,
     };
     let engines = worker.engines();
     if engines.is_empty() {
@@ -1517,7 +1783,7 @@ fn audio_thread(shared: Arc<Shared>, opts: AlsaOptions, ready: mpsc::Sender<Resu
         .filter(|k| engines.contains(k))
         .unwrap_or(engines[0]);
     // Open the device now so a missing sound card is reported at start-up.
-    if let Err(e) = worker.pcm() {
+    if let Err(e) = worker.open_initial() {
         let _ = ready.send(Err(e));
         return;
     }
@@ -1527,8 +1793,159 @@ fn audio_thread(shared: Arc<Shared>, opts: AlsaOptions, ready: mpsc::Sender<Resu
         other_voices,
         engines,
         current: worker.current,
+        pulse: pulse_for_keepalive,
     }));
     worker.run();
+}
+
+// ---- voice listing (`tdsr --list-voices`) -----------------------------------
+
+/// Format the multi-engine voice list with the exact menu indices
+/// `AlsaSynth::voice_id(idx)` assigns.
+fn render_voice_list(
+    espeak_voices: Option<&VoiceCatalogue>,
+    sections: &[(&str, &str, &str, Vec<String>)],
+) -> String {
+    let espeak_count = espeak_voices.map(|v| v.len()).unwrap_or(0);
+    let extra_count: usize = sections.iter().map(|(_, _, _, names)| names.len()).sum();
+    let total = espeak_count + extra_count;
+    let width = total.saturating_sub(1).to_string().len().max(1);
+    let mut out = String::new();
+    if let Some(cat) = espeak_voices {
+        if !cat.is_empty() {
+            // Strip the espeak-only footer so we print one combined footer below
+            let rendered = cat.render();
+            if let Some((body, _)) = rendered.rsplit_once("\nTo choose one:") {
+                out.push_str(body);
+            } else {
+                out.push_str(&rendered);
+            }
+        }
+    }
+    let mut idx = espeak_count;
+    for (title, prefix, config_key, names) in sections {
+        if names.is_empty() {
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        let _ = writeln!(out, "{title} (config key `{config_key}`):");
+        for name in names {
+            let _ = writeln!(out, "{idx:>width$}  {name}  [{prefix}{name}]");
+            idx += 1;
+        }
+    }
+    let _ = writeln!(
+        out,
+        "\nPress Alt+s in TDSR to switch engines, and Alt+a to step through voices in the current engine.\n\
+         To pick by index: press Alt+c, then V, type the index and press Enter;\n\
+         or set `voice`, `mbrola_voice`, `piper_voice`, `rhvoice_voice`, `pico_voice`\n\
+         or `dectalk_voice` (and optional `engine = ...`) in ~/.tdsr.cfg."
+    );
+    out
+}
+
+/// Discover every engine and voice the multi-engine backend would load and
+/// render them with their menu indices (for `tdsr --list-voices`). Does not
+/// open an audio device.
+pub fn list_voices(opts: &AlsaOptions) -> Result<String> {
+    let espeak = Espeak::load(chunk_callback).ok();
+    let espeak_voices = espeak.as_ref().map(|e| e.voices());
+    #[cfg(feature = "piper")]
+    let can_phonemise = espeak.as_ref().is_some_and(|e| e.can_phonemise());
+
+    #[cfg(feature = "dectalk")]
+    let dectalk_names: Vec<String> = DECTALK_VOICES
+        .iter()
+        .map(|(n, _, _)| (*n).to_string())
+        .collect();
+    #[cfg(not(feature = "dectalk"))]
+    let dectalk_names: Vec<String> = Vec::new();
+
+    #[cfg(feature = "piper")]
+    let piper_names: Vec<String> = if can_phonemise {
+        let dirs = if opts.piper_voices.trim().is_empty() {
+            piper::default_dirs()
+        } else {
+            opts.piper_voices.clone()
+        };
+        piper::find_voices(&dirs)
+            .into_iter()
+            .map(|v| v.name)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    #[cfg(not(feature = "piper"))]
+    let piper_names: Vec<String> = Vec::new();
+
+    let rhvoice_names: Vec<String> =
+        rhvoice::RhvoiceEngine::new(&opts.rhvoice_data, &opts.rhvoice_voice, opts.rhvoice_rate)
+            .map(|e| e.names())
+            .unwrap_or_default();
+
+    let pico_names: Vec<String> =
+        pico::PicoEngine::new(&opts.pico_lang, &opts.pico_voice, opts.pico_rate)
+            .map(|e| e.names())
+            .unwrap_or_default();
+
+    let mbrola_names: Vec<String> = espeak_voices
+        .as_ref()
+        .map(|cat| {
+            collect_mbrola_voices(cat)
+                .into_iter()
+                .map(|v| v.database)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Avoid espeak_Terminate hanging on quick exit (see espeak::list_voices).
+    if let Some(e) = espeak {
+        std::mem::forget(e);
+    }
+
+    let sections: Vec<(&str, &str, &str, Vec<String>)> = vec![
+        (
+            "DECtalk voices",
+            DECTALK_VOICE_PREFIX,
+            "dectalk_voice",
+            dectalk_names,
+        ),
+        (
+            "Piper neural voices",
+            PIPER_VOICE_PREFIX,
+            "piper_voice",
+            piper_names,
+        ),
+        (
+            "RHVoice voices",
+            rhvoice::VOICE_PREFIX,
+            "rhvoice_voice",
+            rhvoice_names,
+        ),
+        (
+            "SVOX Pico voices",
+            pico::VOICE_PREFIX,
+            "pico_voice",
+            pico_names,
+        ),
+        (
+            "MBROLA engine voices",
+            MBROLA_VOICE_PREFIX,
+            "mbrola_voice",
+            mbrola_names,
+        ),
+    ];
+
+    let any_extra = sections.iter().any(|(_, _, _, n)| !n.is_empty());
+    if espeak_voices.as_ref().map_or(true, |v| v.is_empty()) && !any_extra {
+        return Err(TdsrError::Speech(
+            "no speech engines or voices found".to_string(),
+        ));
+    }
+
+    Ok(render_voice_list(espeak_voices.as_ref(), &sections))
 }
 
 // ---- the backend ------------------------------------------------------------
@@ -1547,7 +1964,17 @@ pub struct AlsaSynth {
 
 impl AlsaSynth {
     pub fn new(opts: AlsaOptions) -> Result<Self> {
-        debug!("Creating ALSA backend ({:?})", opts);
+        Self::new_with_output(opts, OutputMode::Alsa)
+    }
+
+    /// Start the multi-engine backend playing through TDSR-managed PulseAudio
+    /// (used by default on WSL2 and when `[speech] backend = pulse`).
+    pub fn new_pulse(opts: AlsaOptions) -> Result<Self> {
+        Self::new_with_output(opts, OutputMode::Pulse)
+    }
+
+    pub fn new_with_output(opts: AlsaOptions, mode: OutputMode) -> Result<Self> {
+        debug!("Creating multi-engine backend ({:?}, {:?})", mode, opts);
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 items: VecDeque::new(),
@@ -1555,13 +1982,13 @@ impl AlsaSynth {
             }),
             wake: Condvar::new(),
             epoch: AtomicU64::new(0),
-            shutdown: AtomicBool::new(false),
+            shutdown: Arc::new(AtomicBool::new(false)),
         });
         let (tx, rx) = mpsc::channel();
         let worker_shared = Arc::clone(&shared);
         let audio_thread = thread::Builder::new()
             .name("tdsr-audio".to_string())
-            .spawn(move || audio_thread(worker_shared, opts, tx))
+            .spawn(move || audio_thread(worker_shared, opts, mode, tx))
             .map_err(|e| TdsrError::Speech(format!("Failed to start audio thread: {}", e)))?;
         let ready = match rx.recv_timeout(INIT_TIMEOUT) {
             Ok(Ok(r)) => r,
@@ -1569,12 +1996,16 @@ impl AlsaSynth {
             Err(_) => {
                 shared.shutdown.store(true, Ordering::SeqCst);
                 return Err(TdsrError::Speech(
-                    "the ALSA device did not answer".to_string(),
+                    "the audio backend did not answer".to_string(),
                 ));
             }
         };
+        if let Some(pulse) = ready.pulse {
+            pulse.spawn_keepalive(Arc::clone(&shared.shutdown));
+        }
         info!(
-            "ALSA backend ready, engines {:?}, {} espeak-ng voices, then {:?}",
+            "Multi-engine backend ready ({:?}), engines {:?}, {} espeak-ng voices, then {:?}",
+            mode,
             ready.engines,
             ready.espeak_voices.as_ref().map(|v| v.len()).unwrap_or(0),
             ready.other_voices
@@ -1686,6 +2117,20 @@ impl Synth for AlsaSynth {
         }
     }
 
+    /// Migrate legacy `voice_idx` values from older TDSR configs (0 = en,
+    /// 1 = en-us, 10 = mb-us1, ...) when espeak-ng is loaded.
+    fn legacy_voice_id(&self, idx: usize) -> Option<String> {
+        if let Some(cat) = &self.espeak_voices {
+            let name = legacy_voice_name(idx)?;
+            return Some(
+                cat.find(name)
+                    .map(|v| v.identifier.clone())
+                    .unwrap_or_else(|| name.to_string()),
+            );
+        }
+        self.voice_id(idx)
+    }
+
     fn speak(&mut self, text: &str) -> Result<()> {
         debug!("Speaking: {}", text);
         self.enqueue(text, false);
@@ -1730,6 +2175,19 @@ impl Synth for AlsaSynth {
         };
         self.current = k;
         self.ask(|reply| Control::Engine(k, reply))
+    }
+
+    fn next_voice(&mut self) -> Result<(String, String)> {
+        self.cancel()?;
+        let (tx, rx) = mpsc::channel();
+        self.control(Control::NextVoice(tx));
+        match rx.recv_timeout(CONTROL_TIMEOUT) {
+            Ok(Ok(pair)) => Ok(pair),
+            Ok(Err(msg)) => Err(TdsrError::Speech(msg)),
+            Err(_) => Err(TdsrError::Speech(
+                "the speech thread did not answer".to_string(),
+            )),
+        }
     }
 
     /// Each engine keeps its voice under its own key; espeak-ng's is `voice`.
@@ -1855,5 +2313,55 @@ mod tests {
         assert_eq!(EngineKind::parse("DECtalk"), Some(EngineKind::Dectalk));
         assert_eq!(EngineKind::parse("espeak-ng"), Some(EngineKind::Espeak));
         assert_eq!(EngineKind::parse("sam"), None);
+    }
+
+    #[test]
+    fn render_voice_list_numbers_extra_engines_after_espeak() {
+        use crate::speech::voices::{EspeakVoice, Gender};
+
+        let cat = VoiceCatalogue::new(
+            vec![
+                EspeakVoice {
+                    name: "English (America)".into(),
+                    identifier: "gmw/en-US".into(),
+                    language: "en-us".into(),
+                    gender: Gender::Male,
+                    installed: true,
+                },
+                EspeakVoice {
+                    name: "English (Great Britain)".into(),
+                    identifier: "gmw/en".into(),
+                    language: "en-gb".into(),
+                    gender: Gender::Male,
+                    installed: true,
+                },
+            ],
+            Vec::new(),
+            None,
+        );
+        let sections = vec![
+            (
+                "Piper neural voices",
+                PIPER_VOICE_PREFIX,
+                "piper_voice",
+                vec!["en_US-ryan-high".to_string()],
+            ),
+            (
+                "RHVoice voices",
+                rhvoice::VOICE_PREFIX,
+                "rhvoice_voice",
+                vec!["slt".to_string()],
+            ),
+        ];
+        let out = render_voice_list(Some(&cat), &sections);
+        assert!(out.contains("0  en-us"), "{}", out);
+        assert!(out.contains("1  en-gb"), "{}", out);
+        assert!(
+            out.contains("2  en_US-ryan-high  [piper:en_US-ryan-high]"),
+            "{}",
+            out
+        );
+        assert!(out.contains("3  slt  [rhvoice:slt]"), "{}", out);
+        assert!(out.contains("Alt+s"), "{}", out);
     }
 }

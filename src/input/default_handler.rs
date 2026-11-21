@@ -170,10 +170,21 @@ impl DefaultKeyHandler {
                 Ok(HandlerAction::Handled)
             }
 
-            // Switch to the next speech engine (the ALSA backend has several)
+            // Switch to the next speech engine (multi-engine backend)
             SwitchEngine => {
                 match state.next_engine() {
                     Ok(name) => state.speak(&name)?,
+                    Err(crate::TdsrError::Speech(msg)) => state.speak(&msg)?,
+                    Err(e) => state.speak(&e.to_string())?,
+                }
+                Ok(HandlerAction::Handled)
+            }
+
+            // Step to the next voice within the current speech engine (Alt+a)
+            SwitchVoice => {
+                match state.next_voice() {
+                    Ok(name) => state.speak(&name)?,
+                    Err(crate::TdsrError::Speech(msg)) => state.speak(&msg)?,
                     Err(e) => state.speak(&e.to_string())?,
                 }
                 Ok(HandlerAction::Handled)

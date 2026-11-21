@@ -7,7 +7,28 @@
 
 set -e
 
-PIPER_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/piper-voices"
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    echo "macOS detected."
+    echo "TDSR on macOS uses the built-in AVFoundation speech synthesizer (Eloquence / VoiceOver)."
+    echo "The Linux voice engines (MBROLA, RHVoice, Pico, Piper) are not used on macOS."
+    echo "Run \`tdsr --list-voices\` to see installed macOS voices, or install Eloquence in"
+    echo "System Settings -> Accessibility -> Spoken Content -> System Voice -> Manage Voices."
+    exit 0
+fi
+
+# When invoked via `sudo ./install-voices.sh`, install Piper voices into the
+# invoking user's home directory rather than /root so their `tdsr` finds them.
+TARGET_USER=""
+TARGET_HOME="$HOME"
+if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    TARGET_USER="$SUDO_USER"
+    SUDO_HOME="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+    if [[ -n "$SUDO_HOME" ]]; then
+        TARGET_HOME="$SUDO_HOME"
+    fi
+fi
+
+PIPER_DIR="${XDG_DATA_HOME:-$TARGET_HOME/.local/share}/piper-voices"
 PIPER_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main"
 
 # Piper voices fetched by default: the high-quality English ones, then some
@@ -93,6 +114,7 @@ install_packages() {
         "espeak-ng"
         "libespeak-ng1"
         "libasound2t64 libasound2"
+        "libasound2-plugins"
         "mbrola"
         "mbrola-us1"
         "mbrola-us2"
@@ -172,6 +194,9 @@ install_piper_voices() {
             fi
         done
     done
+    if [[ -n "$TARGET_USER" ]]; then
+        chown -R "$TARGET_USER:" "$PIPER_DIR" 2>/dev/null || true
+    fi
     echo "Piper voices in $PIPER_DIR:"
     ls "$PIPER_DIR" | sed -n 's/\.onnx$//p' | sed 's/^/  /'
     if [[ ${#failed[@]} -gt 0 ]]; then
@@ -190,8 +215,14 @@ if [[ $PIPER -eq 1 ]]; then
 fi
 
 echo "Done. To use these voices, build TDSR with Piper support:"
-echo "  cargo build --release --features piper"
-echo "and put this in ~/.tdsr.cfg:"
-echo "  [speech]"
-echo "  backend = alsa"
-echo "Then Alt+s steps through the engines."
+echo "  ./build.sh --piper   # or: cargo build --release --features piper"
+if grep -qi microsoft /proc/version 2>/dev/null; then
+    echo "On WSL2, all installed engines are enabled automatically over WSLg PulseAudio."
+    echo "Run \`./target/release/tdsr --list-voices\` to see every voice, then start TDSR"
+    echo "and press Alt+s to step through the engines."
+else
+    echo "and put this in ~/.tdsr.cfg:"
+    echo "  [speech]"
+    echo "  backend = alsa       # or backend = pulse on PulseAudio/PipeWire desktops"
+    echo "Then Alt+s steps through the engines."
+fi

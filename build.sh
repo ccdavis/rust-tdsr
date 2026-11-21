@@ -30,11 +30,14 @@ echo
 SKIP_TESTS=0
 CLEAN=0
 ESPEAK_ONLY=0
+PIPER_MODE="auto"
 for arg in "$@"; do
     case $arg in
         --clean) CLEAN=1 ;;
         --no-test) SKIP_TESTS=1 ;;
         --espeak-only) ESPEAK_ONLY=1 ;;
+        --piper) PIPER_MODE="on" ;;
+        --no-piper) PIPER_MODE="off" ;;
         --help|-h)
             echo "Usage: $0 [options]"
             echo "  --clean        Clean before building"
@@ -42,6 +45,8 @@ for arg in "$@"; do
             echo "  --espeak-only  Build without Speech Dispatcher (PulseAudio + espeak-ng);"
             echo "                 use on distros whose speech-dispatcher is too old (< 0.10),"
             echo "                 e.g. Ubuntu 20.04. Skips the libclang/libspeechd build deps."
+            echo "  --piper        Include Piper neural voice support (--features piper)"
+            echo "  --no-piper     Disable automatic Piper feature detection"
             exit 0
             ;;
     esac
@@ -57,7 +62,7 @@ CARGO_FLAGS=()
 # espeak-ng-only build (--no-default-features): no Speech Dispatcher, no
 #   libclang/libspeechd needed. Auto-selected when speech-dispatcher is missing
 #   or too old, or forced with --espeak-only.
-if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+if [[ "$OSTYPE" == "linux"* ]]; then
     echo -e "${YELLOW}Checking build dependencies...${NC}"
 
     # Is the system speech-dispatcher new enough for the `speech-dispatcher` crate (>= 0.10)?
@@ -98,6 +103,20 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
         echo -e "${GREEN}✓${NC} libclang found"
         echo -e "${GREEN}✓${NC} speech-dispatcher $SPD_VER (Speech Dispatcher backend)"
     fi
+
+    # Enable Piper neural voices when requested, or automatically if Piper
+    # voice models are already installed (e.g. after ./install-voices.sh).
+    PIPER_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/piper-voices"
+    if [[ "$PIPER_MODE" == "on" ]]; then
+        CARGO_FLAGS+=(--features piper)
+        echo -e "${GREEN}✓${NC} Piper neural voices enabled (--piper)"
+    elif [[ "$PIPER_MODE" == "auto" ]] && { ls "$PIPER_DIR"/*.onnx &>/dev/null || ls /usr/share/piper-voices/*.onnx &>/dev/null; }; then
+        CARGO_FLAGS+=(--features piper)
+        echo -e "${GREEN}✓${NC} Piper voices detected; enabling --features piper (use --no-piper to skip)"
+    fi
+    echo
+elif [[ "$OSTYPE" == "darwin"* && "$PIPER_MODE" == "on" ]]; then
+    echo -e "${YELLOW}ℹ${NC} --piper is Linux/WSL only (macOS uses built-in AVFoundation voices); ignoring."
     echo
 fi
 

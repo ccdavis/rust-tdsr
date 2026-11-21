@@ -50,12 +50,29 @@ pub struct VoiceFile {
     pub config: VoiceConfig,
 }
 
+/// Expand a leading `~` or `~/` against `home` (so `piper_voices = ~/.local/share/piper-voices`
+/// in `~/.tdsr.cfg` works just like a full path).
+fn expand_tilde(dir: &str, home: Option<&Path>) -> PathBuf {
+    let dir = dir.trim();
+    if let Some(home) = home {
+        if dir == "~" {
+            return home.to_path_buf();
+        }
+        if let Some(rest) = dir.strip_prefix("~/") {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(dir)
+}
+
 /// Every voice in the `:`-separated directory list `dirs`, sorted by name;
 /// a name found twice is taken from the first directory.
 pub fn find_voices(dirs: &str) -> Vec<VoiceFile> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut voices: Vec<VoiceFile> = Vec::new();
-    for dir in dirs.split(':').filter(|d| !d.is_empty()) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
+    for dir in dirs.split(':').filter(|d| !d.trim().is_empty()) {
+        let dir = expand_tilde(dir, home.as_deref());
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         let mut found: Vec<PathBuf> = entries
@@ -311,17 +328,30 @@ impl PiperVoice {
 }
 
 /// Where to look for voices when the config does not say.
+/// Matches `install-voices.sh`: `$XDG_DATA_HOME/piper-voices`, then
+/// `$HOME/.local/share/piper-voices`, then `/usr/share/piper-voices`.
 pub fn default_dirs() -> String {
-    let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(
-            Path::new(&home)
-                .join(".local/share/piper-voices")
-                .display()
-                .to_string(),
-        );
+    default_dirs_with(
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+fn default_dirs_with(xdg_data_home: Option<PathBuf>, home: Option<PathBuf>) -> String {
+    let mut dirs: Vec<String> = Vec::new();
+    if let Some(xdg) = xdg_data_home.filter(|p| !p.as_os_str().is_empty()) {
+        dirs.push(xdg.join("piper-voices").display().to_string());
     }
-    dirs.push("/usr/share/piper-voices".to_string());
+    if let Some(home) = home.filter(|p| !p.as_os_str().is_empty()) {
+        let local = home.join(".local/share/piper-voices").display().to_string();
+        if !dirs.contains(&local) {
+            dirs.push(local);
+        }
+    }
+    let system = "/usr/share/piper-voices".to_string();
+    if !dirs.contains(&system) {
+        dirs.push(system);
+    }
     dirs.join(":")
 }
 
@@ -397,5 +427,37 @@ mod tests {
         assert_eq!(pcm[1], (PEAK * 32767.0) as i16);
         assert_eq!(pcm[2], (-PEAK / 2.0 * 32767.0) as i16);
         assert_eq!(to_pcm(&[0.0; 3], 100), vec![0; 3]);
+    }
+
+    #[test]
+    fn default_dirs_respects_xdg_and_expands_tilde() {
+        let dirs = default_dirs_with(
+            Some(PathBuf::from("/custom/data")),
+            Some(PathBuf::from("/home/alice")),
+        );
+        assert_eq!(
+            dirs,
+            "/custom/data/piper-voices:/home/alice/.local/share/piper-voices:/usr/share/piper-voices"
+        );
+        // Deduplicates when XDG_DATA_HOME equals $HOME/.local/share
+        let dedup = default_dirs_with(
+            Some(PathBuf::from("/home/alice/.local/share")),
+            Some(PathBuf::from("/home/alice")),
+        );
+        assert_eq!(
+            dedup,
+            "/home/alice/.local/share/piper-voices:/usr/share/piper-voices"
+        );
+        assert_eq!(
+            expand_tilde(
+                "~/.local/share/piper-voices",
+                Some(Path::new("/home/alice"))
+            ),
+            PathBuf::from("/home/alice/.local/share/piper-voices")
+        );
+        assert_eq!(
+            expand_tilde("/usr/share/piper-voices", Some(Path::new("/home/alice"))),
+            PathBuf::from("/usr/share/piper-voices")
+        );
     }
 }
